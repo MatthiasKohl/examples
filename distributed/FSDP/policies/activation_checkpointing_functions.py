@@ -3,6 +3,7 @@ import os
 import torch.distributed as dist
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
+    offload_wrapper,
     CheckpointImpl,
     apply_activation_checkpointing,
 )
@@ -27,5 +28,5 @@ def apply_fsdp_checkpointing(model):
     print(f"--> applying fdsp activation checkpointing...")
 
     apply_activation_checkpointing(
-        model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
+        model, checkpoint_wrapper_fn=offload_wrapper, check_fn=check_fn
     )

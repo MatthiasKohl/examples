@@ -119,7 +119,8 @@ def fsdp_main(args):
         mixed_precision=mixed_precision_policy,
         sharding_strategy=fsdp_config.sharding_strategy,
         device_id=torch.cuda.current_device(),
-        limit_all_gathers=fsdp_config.limit_all_gathers)
+        limit_all_gathers=fsdp_config.limit_all_gathers,
+        cpu_offload=CPUOffload(offload_params=True))
     
     if fsdp_config.fsdp_activation_checkpointing:
         policies.apply_fsdp_checkpointing(model)

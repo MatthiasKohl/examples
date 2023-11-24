@@ -47,6 +47,7 @@ def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler
         for key in batch.keys():
             batch[key] = batch[key].to(local_rank)
         optimizer.zero_grad()
+        #import pdb;pdb.set_trace()
         output = model(input_ids=batch["source_ids"],attention_mask=batch["source_mask"],labels=batch["target_ids"] )
         loss = output["loss"]
         loss.backward()
