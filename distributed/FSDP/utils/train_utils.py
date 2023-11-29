@@ -1,17 +1,15 @@
+import json
 import os
 import torch
 import torch.distributed as dist
 from datetime import datetime
 import tqdm
 from transformers import AutoTokenizer, GPT2TokenizerFast
-from transformers import T5Tokenizer, T5ForConditionalGeneration
-
-g_gigabyte = 1024**3
+from transformers import T5Tokenizer, T5ForConditionalGeneration, T5Config
 
 def setup():
     # initialize the process group
     dist.init_process_group("nccl")
-
 
 def cleanup():
     dist.destroy_process_group()
@@ -23,14 +21,6 @@ def get_date_of_run():
     date_of_run = datetime.now().strftime("%Y-%m-%d-%I:%M:%S_%p")
     print(f"--> current date and time of run = {date_of_run}")
     return date_of_run
-
-
-
-def format_metrics_to_gb(item):
-    """quick function to format numbers to gigabyte and round to 4 digit precision"""
-    metric_num = item / g_gigabyte
-    metric_num = round(metric_num, ndigits=4)
-    return metric_num
 
 def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler=None):
     model.train()
@@ -47,7 +37,7 @@ def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler
         for key in batch.keys():
             batch[key] = batch[key].to(local_rank)
         optimizer.zero_grad()
-        #import pdb;pdb.set_trace()
+        # import pdb;pdb.set_trace()
         output = model(input_ids=batch["source_ids"],attention_mask=batch["source_mask"],labels=batch["target_ids"] )
         loss = output["loss"]
         loss.backward()
@@ -98,6 +88,14 @@ def validation(model, rank, world_size, val_loader):
 
 
 def setup_model(model_name):
+    if os.path.isfile(model_name):
+        with open(model_name) as f:
+            config = json.load(f)
+        t5_config = T5Config(**config)
+        model = T5ForConditionalGeneration(t5_config)
+        # for custom configs, just always use the flan-xl tokenizer
+        tokenizer = T5Tokenizer.from_pretrained("google/flan-t5-xl")
+    else:
         model = T5ForConditionalGeneration.from_pretrained(model_name)
         tokenizer =  T5Tokenizer.from_pretrained(model_name)
-        return model, tokenizer
+    return model, tokenizer

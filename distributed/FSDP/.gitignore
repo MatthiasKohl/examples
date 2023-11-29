@@ -1,3 +1,5 @@
 __pycache__/
 *.pt
 *.csv
+*.out
+test*/

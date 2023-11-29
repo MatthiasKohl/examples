@@ -1,19 +1,10 @@
 import os
 import argparse
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from transformers import AutoTokenizer, GPT2TokenizerFast
-from transformers import T5Tokenizer, T5ForConditionalGeneration
-import functools
 from torch.optim.lr_scheduler import StepLR
-import torch.nn.functional as F
 import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from transformers.models.t5.modeling_t5 import T5Block
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -25,23 +16,15 @@ from torch.distributed.fsdp import (
     StateDictType,
 )
 
-from functools import partial
 from torch.utils.data import DataLoader
-from pathlib import Path
 from summarization_dataset import *
 import policies
 import model_checkpointing
 from configs import fsdp_config, train_config
-from utils import (bfloat_support, setup,
+from utils import (bfloat_support, setup, setup_allocator,
                    cleanup, get_date_of_run,
-                   format_metrics_to_gb,
-                   train,validation,setup_model)
-from transformers.models.t5.modeling_t5 import T5Block
-from typing import Type
+                   train, validation, setup_model)
 import time
-import tqdm
-from datetime import datetime
-
 
 def get_policies(cfg, rank):
 
@@ -73,6 +56,7 @@ def get_policies(cfg, rank):
 
 
 def fsdp_main(args):
+    setup_allocator(train_config)
 
     model, tokenizer = setup_model(train_config.model_name)
 
@@ -90,40 +74,48 @@ def fsdp_main(args):
     #wikihow(tokenizer, type_path, num_samples, input_length, output_length, print_text=False)
     train_dataset = wikihow(tokenizer, 'train', 1500, 512, 150, False) 
     val_dataset = wikihow(tokenizer, 'validation', 300, 512, 150, False)
- 
+
     sampler1 = DistributedSampler(train_dataset, rank=rank, num_replicas=world_size, shuffle=True)
     sampler2 = DistributedSampler(val_dataset, rank=rank, num_replicas=world_size)
 
     setup()
 
-
-    train_kwargs = {'batch_size': args.batch_size, 'sampler': sampler1}
-    test_kwargs = {'batch_size': args.test_batch_size, 'sampler': sampler2}
-    cuda_kwargs = {'num_workers': 2,
-                    'pin_memory': True,
-                    'shuffle': False}
+    train_kwargs = {'batch_size': train_config.batch_size_training, 'sampler': sampler1}
+    test_kwargs = {'batch_size': train_config.batch_size_testing, 'sampler': sampler2}
+    cuda_kwargs = {
+        'num_workers': train_config.num_workers_dataloader,
+        'pin_memory': True,
+        'shuffle': False
+    }
     train_kwargs.update(cuda_kwargs)
     test_kwargs.update(cuda_kwargs)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset,**train_kwargs)
+    train_loader = torch.utils.data.DataLoader(train_dataset, **train_kwargs)
     val_loader = torch.utils.data.DataLoader(val_dataset, **test_kwargs)
  
     torch.cuda.set_device(local_rank)
     
-    # Set up FSDP parameters
-    mixed_precision_policy, t5_auto_wrap_policy = get_policies(train_config, rank)
-    
     # Apply FSDP wrapping to the model
-    model = FSDP(model,
-        auto_wrap_policy=t5_auto_wrap_policy,
-        mixed_precision=mixed_precision_policy,
-        sharding_strategy=fsdp_config.sharding_strategy,
-        device_id=torch.cuda.current_device(),
-        limit_all_gathers=fsdp_config.limit_all_gathers,
-        cpu_offload=CPUOffload(offload_params=True))
-    
-    if fsdp_config.fsdp_activation_checkpointing:
-        policies.apply_fsdp_checkpointing(model)
+    if fsdp_config.enabled:
+        # Set up FSDP parameters
+        mixed_precision_policy, t5_auto_wrap_policy = get_policies(train_config, rank)
+        if fsdp_config.cpu_offload is None:
+            offload = None
+        else:
+            offload = CPUOffload(offload_params=fsdp_config.cpu_offload)
+        model = FSDP(model,
+            auto_wrap_policy=t5_auto_wrap_policy,
+            mixed_precision=mixed_precision_policy,
+            sharding_strategy=fsdp_config.sharding_strategy,
+            device_id=torch.cuda.current_device(),
+            limit_all_gathers=fsdp_config.limit_all_gathers,
+            cpu_offload=offload)
+
+        if fsdp_config.fsdp_activation_checkpointing:
+            policies.apply_fsdp_checkpointing(model)
+    else:
+        # move model to the GPU
+        model = model.to(device=torch.cuda.current_device())
 
     # Set up optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=train_config.lr)
@@ -140,9 +132,8 @@ def fsdp_main(args):
         val_acc_tracking = []
         training_start_time = time.time()
 
-    if rank == 0 and args.track_memory:
-        mem_alloc_tracker = []
-        mem_reserved_tracker = []
+    mem_alloc_tracker = []
+    mem_reserved_tracker = []
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -161,16 +152,11 @@ def fsdp_main(args):
             if args.run_validation:
                 val_acc_tracking.append(curr_val_loss.item())
 
-            if args.track_memory:
-                mem_alloc_tracker.append(
-                    format_metrics_to_gb(torch.cuda.memory_allocated())
-                )
-                mem_reserved_tracker.append(
-                    format_metrics_to_gb(torch.cuda.memory_reserved())
-                )
+            if args.track_memory and not train_config.alloc_type:
+                mem_alloc_tracker.append(torch.cuda.memory_allocated())
+                mem_reserved_tracker.append(torch.cuda.memory_reserved())
 
         if train_config.save_model and curr_val_loss < best_val_loss:
-            
             if fsdp_config.checkpoint_type == StateDictType.FULL_STATE_DICT:
                 model_checkpointing.save_model_checkpoint(
                     model, optimizer, rank, fsdp_config, epoch=1
@@ -183,12 +169,14 @@ def fsdp_main(args):
             if fsdp_config.save_optimizer:
                 model_checkpointing.save_optimizer_checkpoint(
                     model, optimizer, rank, fsdp_config, epoch=1
-                )           
-        if curr_val_loss < best_val_loss:
+                )
 
+        if curr_val_loss < best_val_loss:
             best_val_loss = curr_val_loss
             if rank==0:
                 print(f"-->>>> New Val Loss Record: {best_val_loss}")
+        if rank == 0 and mem_reserved_tracker and mem_alloc_tracker:
+            print(f"Max memory reserved: {max(mem_reserved_tracker) / 1e9:.2f} GB, max memory allocated: {max(mem_alloc_tracker) / 1e9:.2f} GB")
 
     dist.barrier()
     cleanup()
@@ -198,11 +186,11 @@ if __name__ == '__main__':
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch T5 FSDP Example')
     parser.add_argument('--batch-size', type=int, default=4, metavar='N',
-                        help='input batch size for training (default: 64)')
+                        help='input batch size for training (default: 4)')
     parser.add_argument('--test-batch-size', type=int, default=4, metavar='N',
-                        help='input batch size for testing (default: 1000)')
+                        help='input batch size for testing (default: 4)')
     parser.add_argument('--epochs', type=int, default=2, metavar='N',
-                        help='number of epochs to train (default: 3)')
+                        help='number of epochs to train (default: 2)')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
     parser.add_argument('--track_memory', action='store_false', default=True,

@@ -19,6 +19,6 @@ see https://pytorch.org to install at least 1.12 and ideally a current nightly b
 Start the training with Torchrun (adjust nproc_per_node to your GPU count):
 
 ```
-torchrun --nnodes 1 --nproc_per_node 4  T5_training.py
+torchrun --nnodes 1 --nproc_per_node 1  T5_training.py
 
 ```
