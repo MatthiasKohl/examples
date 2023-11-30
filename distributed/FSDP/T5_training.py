@@ -21,7 +21,7 @@ from summarization_dataset import *
 import policies
 import model_checkpointing
 from configs import fsdp_config, train_config
-from utils import (bfloat_support, setup, setup_allocator,
+from utils import (bfloat_support, setup, setup_allocator, teardown_allocator,
                    cleanup, get_date_of_run,
                    train, validation, setup_model)
 import time
@@ -55,15 +55,16 @@ def get_policies(cfg, rank):
     return mixed_precision_policy, wrapping_policy
 
 
-def fsdp_main(args):
-    setup_allocator(train_config)
+def fsdp_main():
+    allocator = setup_allocator(train_config)
+
+    torch.manual_seed(train_config.seed)
 
     model, tokenizer = setup_model(train_config.model_name)
 
     local_rank = int(os.environ['LOCAL_RANK'])
     rank = int(os.environ['RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
-
 
     dataset = load_dataset('wikihow', 'all', data_dir='data/')
     print(dataset.keys())
@@ -135,10 +136,10 @@ def fsdp_main(args):
     mem_alloc_tracker = []
     mem_reserved_tracker = []
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, train_config.epochs + 1):
         t0 = time.time()
-        train_accuracy = train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
-        if args.run_validation:
+        train_accuracy = train(train_config, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
+        if train_config.run_validation:
             curr_val_loss = validation(model, rank, world_size, val_loader)
         scheduler.step()
         
@@ -149,10 +150,10 @@ def fsdp_main(args):
             dur.append(time.time() - t0)
             train_acc_tracking.append(train_accuracy.item())
 
-            if args.run_validation:
+            if train_config.run_validation:
                 val_acc_tracking.append(curr_val_loss.item())
 
-            if args.track_memory and not train_config.alloc_type:
+            if train_config.track_memory and not train_config.alloc_type:
                 mem_alloc_tracker.append(torch.cuda.memory_allocated())
                 mem_reserved_tracker.append(torch.cuda.memory_reserved())
 
@@ -179,26 +180,9 @@ def fsdp_main(args):
             print(f"Max memory reserved: {max(mem_reserved_tracker) / 1e9:.2f} GB, max memory allocated: {max(mem_alloc_tracker) / 1e9:.2f} GB")
 
     dist.barrier()
+    teardown_allocator(allocator)
     cleanup()
 
 
 if __name__ == '__main__':
-    # Training settings
-    parser = argparse.ArgumentParser(description='PyTorch T5 FSDP Example')
-    parser.add_argument('--batch-size', type=int, default=4, metavar='N',
-                        help='input batch size for training (default: 4)')
-    parser.add_argument('--test-batch-size', type=int, default=4, metavar='N',
-                        help='input batch size for testing (default: 4)')
-    parser.add_argument('--epochs', type=int, default=2, metavar='N',
-                        help='number of epochs to train (default: 2)')
-    parser.add_argument('--seed', type=int, default=1, metavar='S',
-                        help='random seed (default: 1)')
-    parser.add_argument('--track_memory', action='store_false', default=True,
-                        help='track the gpu memory')
-    parser.add_argument('--run_validation', action='store_false', default=True,
-                        help='running the validation')
-    args = parser.parse_args()
-
-    torch.manual_seed(args.seed)
-    
-    fsdp_main(args)
+    fsdp_main()

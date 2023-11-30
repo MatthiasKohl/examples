@@ -26,14 +26,15 @@ def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler
     model.train()
     local_rank = int(os.environ['LOCAL_RANK'])
     fsdp_loss = torch.zeros(2).to(local_rank)
-  
+    n_batches = min(len(train_loader), args.max_steps_per_epoch)
+
     if sampler:
         sampler.set_epoch(epoch)
     if rank==0:
         inner_pbar = tqdm.tqdm(
-            range(len(train_loader)), colour="blue", desc="r0 Training Epoch"
+            range(n_batches), colour="blue", desc="r0 Training Epoch"
         )
-    for batch in train_loader:
+    for i, batch in enumerate(train_loader):
         for key in batch.keys():
             batch[key] = batch[key].to(local_rank)
         optimizer.zero_grad()
@@ -46,10 +47,11 @@ def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler
         fsdp_loss[1] += len(batch)
         if rank==0:
             inner_pbar.update(1)
+        if i + 1 >= n_batches:
+            break
 
     dist.all_reduce(fsdp_loss, op=dist.ReduceOp.SUM)
     train_accuracy = fsdp_loss[0] / fsdp_loss[1]
-
 
     if rank == 0:
         inner_pbar.close()

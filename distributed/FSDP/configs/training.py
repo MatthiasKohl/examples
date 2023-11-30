@@ -14,9 +14,15 @@ class train_config:
     use_fp16: bool=False
     mixed_precision: bool=True
     save_model: bool=False
+    epochs: int=2
+    max_steps_per_epoch: int=50
+    seed: int=1
+    track_memory: bool=True
+    run_validation: bool=False
 
     # allocator options
-    alloc_type: str="malloc_prefetch"
+    alloc_type: str="sam_rmm"
+    alloc_initial_pool_size: int=8 * (1024 ** 3)
     alloc_max_pool_size: int=256 * (1024 ** 3)
 
 # following model sizes to be tested:
