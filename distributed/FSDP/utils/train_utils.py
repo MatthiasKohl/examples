@@ -89,15 +89,32 @@ def validation(model, rank, world_size, val_loader):
     return val_loss
 
 
-def setup_model(model_name):
+def setup_model(model_name, **kwargs):
     if os.path.isfile(model_name):
         with open(model_name) as f:
             config = json.load(f)
+
+        for key, val in kwargs.items():
+            if key not in config:
+                print(f"Invalid custom model arg: {key} ({val}). Ignoring")
+
+        add_args = {k: v for k, v in kwargs.items() if k in config and config[k] != v}
+        config.update(add_args)
+
+        print(f"Setup model: using custom config from {model_name} "
+              f"with updated args: {add_args}")
         t5_config = T5Config(**config)
         model = T5ForConditionalGeneration(t5_config)
         # for custom configs, just always use the flan-xl tokenizer
         tokenizer = T5Tokenizer.from_pretrained("google/flan-t5-xl")
     else:
+        if kwargs:
+            print(
+                f"Setup model: ignoring kwargs {kwargs} because model config "
+                f"{model_name} is chosen"
+            )
+        else:
+            print(f"Setup model: using default model config {model_name}")
         model = T5ForConditionalGeneration.from_pretrained(model_name)
         tokenizer =  T5Tokenizer.from_pretrained(model_name)
     return model, tokenizer

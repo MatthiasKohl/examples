@@ -55,12 +55,12 @@ def get_policies(cfg, rank):
     return mixed_precision_policy, wrapping_policy
 
 
-def fsdp_main():
+def fsdp_main(model_kwargs):
     allocator = setup_allocator(train_config)
 
     torch.manual_seed(train_config.seed)
 
-    model, tokenizer = setup_model(train_config.model_name)
+    model, tokenizer = setup_model(train_config.model_name, **model_kwargs)
 
     local_rank = int(os.environ['LOCAL_RANK'])
     rank = int(os.environ['RANK'])
@@ -139,15 +139,18 @@ def fsdp_main():
     for epoch in range(1, train_config.epochs + 1):
         t0 = time.time()
         train_accuracy = train(train_config, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
+        train_time = time.time() - t0
         if train_config.run_validation:
             curr_val_loss = validation(model, rank, world_size, val_loader)
         scheduler.step()
-        
+
         if rank == 0:
-
-            print(f"--> epoch {epoch} completed...entering save and stats zone")
-
             dur.append(time.time() - t0)
+            print(
+                f"--> epoch {epoch} completed...entering save and stats zone. "
+                f"Train time: {train_time} s. Full epoch time: {dur[-1]} s"
+            )
+
             train_acc_tracking.append(train_accuracy.item())
 
             if train_config.run_validation:
@@ -185,4 +188,61 @@ def fsdp_main():
 
 
 if __name__ == '__main__':
-    fsdp_main()
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        if v.lower() in ('yes', 'true', 't', 'y', '1'):
+            return True
+        elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+            return False
+        else:
+            raise argparse.ArgumentTypeError('Boolean value expected.')
+
+    parser = argparse.ArgumentParser(
+        description="Train T5, override default config")
+    parser.add_argument_group("model")
+    parser.add_argument("--d_ff", type=int, default=None)
+    parser.add_argument("--d_model", type=int, default=None)
+    parser.add_argument("--n_positions", type=int, default=None)
+    parser.add_argument("--num_heads", type=int, default=None)
+    parser.add_argument("--num_layers", type=int, default=None)
+    parser.add_argument_group("fsdp")
+    parser.add_argument("--use_fsdp", type=str2bool, default=None)
+    parser.add_argument("--fsdp_activation_checkpointing", type=str2bool, default=None)
+    parser.add_argument("--cpu_offload", type=str2bool, default=None)
+    parser.add_argument_group("training")
+    parser.add_argument("--model_name", default=None)
+    parser.add_argument("--batch_size_training", type=int, default=None)
+    parser.add_argument("--alloc_type", default=None)
+    parser.add_argument("--alloc_max_pool_size", type=int, default=None)
+    parser.add_argument("--max_steps_per_epoch", type=int, default=None)
+    args = parser.parse_args()
+
+    model_kwargs = {
+        a: getattr(args, a) for a in
+        ["d_ff", "d_model", "n_positions", "num_heads", "num_layers"]
+        if getattr(args, a) is not None
+    }
+    # decoder layers is always the same as num_layers for simplicity
+    if "num_layers" in model_kwargs:
+        model_kwargs["num_decoder_layers"] = model_kwargs["num_layers"]
+    if args.use_fsdp is not None:
+        fsdp_config.enabled = args.use_fsdp
+    group_args = [
+        (fsdp_config, ["fsdp_activation_checkpointing", "cpu_offload"]),
+        (train_config, [
+            "model_name", "batch_size_training", "alloc_type",
+            "alloc_max_pool_size", "max_steps_per_epoch"
+        ])
+    ]
+    for group, arg_keys in group_args:
+        for arg_key in arg_keys:
+            val = getattr(args, arg_key)
+            if val is not None:
+                print(
+                    f"Overriding {arg_key} with {val} (previously "
+                    f"{getattr(group, arg_key)})"
+                )
+                setattr(group, arg_key, val)
+
+    fsdp_main(model_kwargs)

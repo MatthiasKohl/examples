@@ -15,23 +15,12 @@ class train_config:
     mixed_precision: bool=True
     save_model: bool=False
     epochs: int=2
-    max_steps_per_epoch: int=50
+    max_steps_per_epoch: int=40
     seed: int=1
     track_memory: bool=True
     run_validation: bool=False
 
     # allocator options
-    alloc_type: str="sam_rmm"
+    alloc_type: str="rmm"
     alloc_initial_pool_size: int=8 * (1024 ** 3)
     alloc_max_pool_size: int=256 * (1024 ** 3)
-
-# following model sizes to be tested:
-# 2048 5120 (flan-t5-xl)
-# 2304 5760
-# 2560 6400
-# 2816 7040 (OOM with batch size 4 and default allocator)
-# 3072 7680 (heads 48)
-# 3328 8320
-# 3584 8960
-# 3840 9600
-# 4096 10240 (flan-t5-xxl)
