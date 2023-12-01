@@ -22,5 +22,5 @@ class train_config:
 
     # allocator options
     alloc_type: str="rmm"
-    alloc_initial_pool_size: int=8 * (1024 ** 3)
-    alloc_max_pool_size: int=256 * (1024 ** 3)
+    alloc_initial_pool_size: int=48 * (1024 ** 3)
+    alloc_max_pool_size: int=96 * (1024 ** 3)
