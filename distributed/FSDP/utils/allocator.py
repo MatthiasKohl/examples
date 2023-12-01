@@ -259,7 +259,8 @@ class CustomTorchAllocator(torch.cuda.memory.CUDAPluggableAllocator):
             pass
 
 def setup_allocator(train_config):
-    if train_config.alloc_type == "rmm":
+    alloc_type = (train_config.alloc_type or "").lower()
+    if alloc_type == "rmm":
         # important: cannot use torch.cuda.current_device() to get the current
         # device since that actually initializes torch's CUDA state including
         # the default caching allocator. Instead, use cudart directly
@@ -269,23 +270,26 @@ def setup_allocator(train_config):
         print(f"Setting up RMM allocator for device {device}")
         rmm.reinitialize(
             pool_allocator=True, managed_memory=True,
+            initial_pool_size=train_config.alloc_initial_pool_size,
             maximum_pool_size=train_config.alloc_max_pool_size,
             devices=[device]
         )
         allocator = rmm_torch_allocator
-    elif train_config.alloc_type.lower().startswith("sam_"):
-        print(f"Setting up custom allocator {train_config.alloc_type}")
+    elif alloc_type.startswith("sam_"):
+        print(f"Setting up custom allocator {alloc_type}")
         allocator = CustomTorchAllocator(
-            train_config.alloc_type,
+            alloc_type,
             initial_pool_size=train_config.alloc_initial_pool_size,
             max_pool_size=train_config.alloc_max_pool_size
         )
+    elif alloc_type:
+        raise ValueError(f"Unexpected allocator type {alloc_type}")
     else:
         allocator = None
 
     if allocator is not None:
         torch.cuda.memory.change_current_allocator(allocator)
-        print(f"Allocator {train_config.alloc_type} set up")
+        print(f"Allocator {alloc_type} set up")
     return allocator
 
 

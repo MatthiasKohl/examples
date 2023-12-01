@@ -157,7 +157,7 @@ def fsdp_main(model_kwargs):
                 val_acc_tracking.append(curr_val_loss.item())
 
             if train_config.track_memory and not train_config.alloc_type:
-                mem_alloc_tracker.append(torch.cuda.memory_allocated())
+                mem_alloc_tracker.append(torch.cuda.max_memory_allocated())
                 mem_reserved_tracker.append(torch.cuda.memory_reserved())
 
         if train_config.save_model and curr_val_loss < best_val_loss:
@@ -240,7 +240,7 @@ if __name__ == '__main__':
             val = getattr(args, arg_key)
             if val is not None:
                 print(
-                    f"Overriding {arg_key} with {val} (previously "
+                    f"Config: over-writing {arg_key} with {val} (previously "
                     f"{getattr(group, arg_key)})"
                 )
                 setattr(group, arg_key, val)

@@ -56,7 +56,7 @@ def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler
     if rank == 0:
         inner_pbar.close()
         print(
-                f"Train Epoch: \t{epoch}, Loss: \t{train_accuracy:.4f}"
+                f"Train Epoch: \t{epoch}, #epoch steps: {n_batches}, Loss: \t{train_accuracy:.4f}"
             )
     return train_accuracy
 
