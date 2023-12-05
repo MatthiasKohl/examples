@@ -120,10 +120,8 @@ class sam_device_memory_resource final : public rmm::mr::device_memory_resource 
   void* do_allocate(std::size_t bytes, [[maybe_unused]] rmm::cuda_stream_view stream) override
   {
     if (COND_UNLIKELY(bytes <= 0)) return nullptr;
-    // many functions may implicitly assume that CUDA allocations are always
-    // aligned to at least 256 bytes: we provide the same guarantee here
-    // note that `malloc` does not provide this guarantee !
-    static constexpr ssize_t MIN_ALIGN = 256;
+    // the pool allocator should get (huge) page-aligned allocations
+    static constexpr ssize_t MIN_ALIGN = 1 << 21;
     void* ptr{nullptr};
     int status = posix_memalign(&ptr, MIN_ALIGN, bytes);
     if (COND_UNLIKELY(status != 0)) {
@@ -134,8 +132,10 @@ class sam_device_memory_resource final : public rmm::mr::device_memory_resource 
     // this may not be ideal, but we don't know the device we're allocating on
     int device; CUDA_TRY(cudaGetDevice(&device));
     CUDA_TRY(cudaMemAdvise(ptr, bytes, cudaMemAdviseSetPreferredLocation, device));
+    CUDA_TRY(cudaMemPrefetchAsync(ptr, bytes, device));
+    CUDA_TRY(cudaDeviceSynchronize());
 
-    //if (bytes > size_t{128*1024*1024}) fprintf(stderr, "Info: allocated %llu\\n", (unsigned long long)bytes);
+    if (bytes > size_t{128*1024*1024}) fprintf(stderr, "Info: allocated %llu\\n", (unsigned long long)bytes);
     return ptr;
   }
 

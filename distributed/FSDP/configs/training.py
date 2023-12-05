@@ -15,12 +15,12 @@ class train_config:
     mixed_precision: bool=True
     save_model: bool=False
     epochs: int=2
-    max_steps_per_epoch: int=40
+    max_steps_per_epoch: int=8
     seed: int=1
     track_memory: bool=True
     run_validation: bool=False
 
     # allocator options
     alloc_type: str="rmm"
-    alloc_initial_pool_size: int=48 * (1024 ** 3)
+    alloc_initial_pool_size: int=24 * (1024 ** 3)
     alloc_max_pool_size: int=96 * (1024 ** 3)

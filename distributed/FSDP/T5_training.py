@@ -227,6 +227,10 @@ if __name__ == '__main__':
     if "num_layers" in model_kwargs:
         model_kwargs["num_decoder_layers"] = model_kwargs["num_layers"]
     if args.use_fsdp is not None:
+        print(
+            f"Config: over-writing fsdp enabled: {args.use_fsdp}"
+            f"(previously {fsdp_config.enabled})"
+        )
         fsdp_config.enabled = args.use_fsdp
     group_args = [
         (fsdp_config, ["fsdp_activation_checkpointing", "cpu_offload"]),

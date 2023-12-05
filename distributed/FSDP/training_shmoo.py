@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 from configs import train_config
-# TODO sam_rmm with hugetlbfs on scv-hw13, CPU pointer chasing 64GiB footprint
+# TODO rmm with prefetch hints
 
 ALLOC_TYPES = ["", "rmm", "fsdp", "fsdp_act_offload", "fsdp_cpu_offload"]
 MODEL_SIZES = [
@@ -17,9 +17,9 @@ MODEL_SIZES = [
     (3584, 8960, 32, 144),
     (3840, 9600, 32, 160),
     (4096, 10240, 32, 176),
-    (4096, 10240, 64, 192)
+    (4096, 10240, 64, 256)
 ]
-BATCH_SIZES = [(2 ** x, max(96, 96 + (x - 8) * 8)) for x in range(5)]
+BATCH_SIZES = [(2 ** x, max(96, 96 + (x - 8) * 8)) for x in range(6)]
 TIMING_REGEX = re.compile(
     r"Train time: ([0-9-\.]+) s. Full epoch time: ([0-9-\.]+) s")
 STEPS_REGEX = re.compile(r", #epoch steps: (\d+),")
@@ -80,12 +80,11 @@ def parse_result(result, config):
 def get_alloc_type_config(alloc_type):
     config = {"alloc_type": alloc_type}
     if "fsdp" in alloc_type:
+        # use default allocator here !
+        config["alloc_type"] = ""
         config["use_fsdp"] = True
-        del config["alloc_type"]
-        if "act_offload" in alloc_type:
-            config["fsdp_activation_checkpointing"] = True
-        elif "cpu_offload" in alloc_type:
-            config["cpu_offload"] = True
+        config["fsdp_activation_checkpointing"] = "act_offload" in alloc_type
+        config["cpu_offload"] = "cpu_offload" in alloc_type
     else:
         config["use_fsdp"] = False
     return config
