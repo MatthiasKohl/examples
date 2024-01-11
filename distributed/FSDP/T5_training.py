@@ -57,17 +57,18 @@ def get_policies(cfg, rank):
     return mixed_precision_policy, wrapping_policy
 
 
+# TODO check if we can make this work. the gradients would also need to be pinned to device (maybe with pack/unpack hooks) !
 def model_pin_device(model):
     for p in model.parameters():
         status = cudart.cudaMemAdvise(
             p.data_ptr(), p.element_size() * p.nelement(),
             cudart.cudaMemoryAdvise.cudaMemAdviseSetPreferredLocation, 0
         )
-        assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0])
+        assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0]) + " for " + str(p) + " size " + str(p.element_size() * p.nelement())
         status = cudart.cudaMemPrefetchAsync(
-            p.data_ptr(), p.element_size() * p.nelement(), 0
+            p.data_ptr(), p.element_size() * p.nelement(), 0, 0
         )
-        assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0])
+        assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0]) + " for " + str(p) + " size " + str(p.element_size() * p.nelement())
 
 
 def fsdp_main(model_kwargs, alloc_type):

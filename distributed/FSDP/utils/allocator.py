@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 
 
-VALID_TYPES = ["sam_device_prefetch", "sam_device_noprefetch", "sam_rmm", "sam_rmm_default", "sam_rmm_managed", "sam_rmm_managed_default"]
+VALID_TYPES = ["sam_device_prefetch", "sam_device_noprefetch", "sam_rmm", "sam_rmm_default", "sam_rmm_managed", "sam_rmm_managed_default", "sam_rmm_cpu"]
 
 MACROS = """
 #include <cstdio>
