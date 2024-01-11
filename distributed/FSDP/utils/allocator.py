@@ -301,6 +301,111 @@ void custom_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
 }
 """
 
+SAM_RMM_CPU = MACROS + """
+#include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device/per_device_resource.hpp>
+#include <rmm/mr/device/pool_memory_resource.hpp>
+
+class sam_device_memory_resource final : public rmm::mr::device_memory_resource {
+  public:
+  sam_device_memory_resource()                                  = default;
+  ~sam_device_memory_resource() override                        = default;
+  sam_device_memory_resource(sam_device_memory_resource const&) = default;  ///< @default_copy_constructor
+  sam_device_memory_resource(sam_device_memory_resource&&)      = default;  ///< @default_move_constructor
+  sam_device_memory_resource& operator=(sam_device_memory_resource const&) =
+    default;  ///< @default_copy_assignment{sam_device_memory_resource}
+  sam_device_memory_resource& operator=(sam_device_memory_resource&&) =
+    default;  ///< @default_move_assignment{sam_device_memory_resource}
+
+  [[nodiscard]] bool supports_streams() const noexcept override { return false; }
+  [[nodiscard]] bool supports_get_mem_info() const noexcept override { return false; }
+
+  private:
+  void* do_allocate(std::size_t bytes, [[maybe_unused]] rmm::cuda_stream_view stream) override
+  {
+    if (COND_UNLIKELY(bytes <= 0)) return nullptr;
+    // the pool allocator should get (huge) page-aligned allocations
+    static constexpr ssize_t MIN_ALIGN = 1 << 21;
+    void* ptr{nullptr};
+    int status = posix_memalign(&ptr, MIN_ALIGN, bytes);
+    if (COND_UNLIKELY(status != 0)) {
+      fprintf(stderr, "OOM for request of size %llu, aligned to %d\\n", (unsigned long long)bytes, (int)MIN_ALIGN);
+      throw std::bad_alloc{};
+    }
+
+    int device; CUDA_TRY(cudaGetDevice(&device));
+    CUDA_TRY(cudaMemAdvise(ptr, bytes, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId));
+    CUDA_TRY(cudaMemAdvise(ptr, bytes, cudaMemAdviseSetAccessedBy, device));
+
+    if (bytes > size_t{128*1024*1024}) fprintf(stderr, "Info: allocated %llu\\n", (unsigned long long)bytes);
+    return ptr;
+  }
+
+  void do_deallocate(void* ptr,
+                     [[maybe_unused]] std::size_t bytes,
+                     [[maybe_unused]] rmm::cuda_stream_view stream) override
+  {
+    //if (bytes > size_t{128*1024*1024}) fprintf(stderr, "Info: freeing %llu\\n", (unsigned long long)bytes);
+    free(ptr);
+  }
+
+  [[nodiscard]] bool do_is_equal(rmm::mr::device_memory_resource const& other) const noexcept override
+  {
+    return dynamic_cast<sam_device_memory_resource const*>(&other) != nullptr;
+  }
+  [[nodiscard]] std::pair<std::size_t, std::size_t> do_get_mem_info(
+    rmm::cuda_stream_view) const override
+  {
+    return std::make_pair(0, 0);
+  }
+};
+
+extern "C" {
+
+sam_device_memory_resource* sam_resource{nullptr};
+typedef rmm::mr::pool_memory_resource<sam_device_memory_resource> pool_resource;
+pool_resource** pool_resources{nullptr};
+int device_count{0};
+
+static void __attribute__((constructor)) init() {
+  sam_resource = new sam_device_memory_resource{};
+  auto initial_pool_size = size_t{<%initial_pool_size%>};
+  auto max_pool_size = size_t{<%max_pool_size%>};
+  CUDA_TRY(cudaGetDeviceCount(&device_count));
+  pool_resources = new pool_resource*[device_count];
+  printf("Allocator: %d devices, init pool size %llu, max pool size %llu\\n",
+    device_count, (unsigned long long)initial_pool_size,
+    (unsigned long long)max_pool_size);
+  for (int device = 0; device < device_count; ++device) {
+    CUDA_TRY(cudaSetDevice(device));
+    pool_resources[device] = new pool_resource(
+      sam_resource, initial_pool_size, max_pool_size
+    );
+    rmm::mr::set_per_device_resource(rmm::cuda_device_id{device}, pool_resources[device]);
+  }
+}
+
+static void __attribute__((destructor)) finalize() {
+  for (int device = 0; device < device_count; ++device) {
+    delete pool_resources[device];
+  }
+  delete[] pool_resources;
+  delete sam_resource;
+}
+
+void* custom_alloc(ssize_t size, int device, cudaStream_t stream) {
+  auto* mr = rmm::mr::get_per_device_resource(rmm::cuda_device_id{device});
+  return mr->allocate(size, rmm::cuda_stream_view{stream});
+}
+void custom_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
+  auto* mr = rmm::mr::get_per_device_resource(rmm::cuda_device_id{device});
+  mr->deallocate(ptr, size, rmm::cuda_stream_view{stream});
+}
+}
+"""
+
 SAM_RMM_MANAGED = MACROS + """
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>

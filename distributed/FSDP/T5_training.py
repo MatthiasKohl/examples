@@ -26,6 +26,8 @@ from utils import (bfloat_support, setup, setup_allocator, teardown_allocator,
                    train, validation, setup_model)
 import time
 
+from cuda import cudart
+
 def get_policies(cfg, rank):
 
     """establish current policies for mixed precision and fsdp wrapping"""
@@ -55,7 +57,20 @@ def get_policies(cfg, rank):
     return mixed_precision_policy, wrapping_policy
 
 
-def fsdp_main(model_kwargs):
+def model_pin_device(model):
+    for p in model.parameters():
+        status = cudart.cudaMemAdvise(
+            p.data_ptr(), p.element_size() * p.nelement(),
+            cudart.cudaMemoryAdvise.cudaMemAdviseSetPreferredLocation, 0
+        )
+        assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0])
+        status = cudart.cudaMemPrefetchAsync(
+            p.data_ptr(), p.element_size() * p.nelement(), 0
+        )
+        assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0])
+
+
+def fsdp_main(model_kwargs, alloc_type):
     allocator = setup_allocator(train_config)
 
     torch.manual_seed(train_config.seed)
@@ -117,6 +132,8 @@ def fsdp_main(model_kwargs):
     else:
         # move model to the GPU
         model = model.to(device=torch.cuda.current_device())
+        if alloc_type.lower() == "sam_rmm_cpu":
+            model_pin_device(model)
 
     # Set up optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=train_config.lr)
@@ -137,12 +154,14 @@ def fsdp_main(model_kwargs):
     mem_reserved_tracker = []
 
     for epoch in range(1, train_config.epochs + 1):
+        torch.cuda.nvtx.range_push(f"EP {epoch}")
         t0 = time.time()
         train_accuracy = train(train_config, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
         train_time = time.time() - t0
         if train_config.run_validation:
             curr_val_loss = validation(model, rank, world_size, val_loader)
         scheduler.step()
+        torch.cuda.nvtx.range_pop()
 
         if rank == 0:
             dur.append(time.time() - t0)
@@ -249,4 +268,16 @@ if __name__ == '__main__':
                 )
                 setattr(group, arg_key, val)
 
-    fsdp_main(model_kwargs)
+    # allow calling directly without torchrun
+    if 'LOCAL_RANK' not in os.environ:
+        os.environ['LOCAL_RANK'] = '0'
+    if 'RANK' not in os.environ:
+        os.environ['RANK'] = '0'
+    if 'WORLD_SIZE' not in os.environ:
+        os.environ['WORLD_SIZE'] = '1'
+    if 'MASTER_ADDR' not in os.environ:
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+    if 'MASTER_PORT' not in os.environ:
+        os.environ['MASTER_PORT'] = '29400'
+
+    fsdp_main(model_kwargs, train_config.alloc_type)

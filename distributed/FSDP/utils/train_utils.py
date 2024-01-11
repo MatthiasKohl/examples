@@ -35,16 +35,26 @@ def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler
             range(n_batches), colour="blue", desc="r0 Training Epoch"
         )
     for i, batch in enumerate(train_loader):
+        torch.cuda.nvtx.range_push(f"EP {epoch} / it {i}")
         for key in batch.keys():
             batch[key] = batch[key].to(local_rank)
+        torch.cuda.nvtx.range_push(f"opt zero")
         optimizer.zero_grad()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push(f"forward")
         # import pdb;pdb.set_trace()
         output = model(input_ids=batch["source_ids"],attention_mask=batch["source_mask"],labels=batch["target_ids"] )
         loss = output["loss"]
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push(f"backward")
         loss.backward()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push(f"opt")
         optimizer.step()
+        torch.cuda.nvtx.range_pop()
         fsdp_loss[0] += loss.item()
         fsdp_loss[1] += len(batch)
+        torch.cuda.nvtx.range_pop()
         if rank==0:
             inner_pbar.update(1)
         if i + 1 >= n_batches:
