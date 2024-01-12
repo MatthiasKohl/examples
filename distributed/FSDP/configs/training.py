@@ -24,3 +24,6 @@ class train_config:
     alloc_type: str="rmm"
     alloc_initial_pool_size: int=24 * (1024 ** 3)
     alloc_max_pool_size: int=96 * (1024 ** 3)
+    pool_location: str="default"
+    pool_accessed_by: str="default"
+    pool_prefetch: str="default"

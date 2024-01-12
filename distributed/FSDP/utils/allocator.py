@@ -5,14 +5,22 @@ from rmm.allocators.torch import rmm_torch_allocator
 import torch
 import torch.utils.cpp_extension as cpp_extension
 
+from contextlib import contextmanager
 import ctypes
+from enum import Enum
 import os
 import platform
 import subprocess
 import tempfile
 
 
-VALID_TYPES = ["sam_device_prefetch", "sam_device_noprefetch", "sam_rmm", "sam_rmm_default", "sam_rmm_managed", "sam_rmm_managed_default", "sam_rmm_cpu"]
+VALID_TYPES = ["sam_device_prefetch", "sam_device_noprefetch", "sam_rmm", "sam_rmm_managed"]
+
+class DeviceType(Enum):
+    DEFAULT = (0, "cudaMemLocationTypeInvalid")
+    DEVICE = (1, "cudaMemLocationTypeDevice")
+    HOST = (2, "cudaMemLocationTypeHost")
+
 
 MACROS = """
 #include <cstdio>
@@ -102,6 +110,10 @@ SAM_RMM = MACROS + """
 #include <rmm/mr/device/per_device_resource.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
 
+static enum cudaMemLocationType prefetch = cudaMemLocationTypeInvalid;
+static enum cudaMemLocationType location = cudaMemLocationTypeInvalid;
+static enum cudaMemLocationType accessed_by = cudaMemLocationTypeInvalid;
+
 class sam_device_memory_resource final : public rmm::mr::device_memory_resource {
   public:
   sam_device_memory_resource()                                  = default;
@@ -131,7 +143,18 @@ class sam_device_memory_resource final : public rmm::mr::device_memory_resource 
 
     // this may not be ideal, but we don't know the device we're allocating on
     int device; CUDA_TRY(cudaGetDevice(&device));
-    CUDA_TRY(cudaMemAdvise(ptr, bytes, cudaMemAdviseSetPreferredLocation, device));
+    if (<%pool_location%> != cudaMemLocationTypeInvalid) {
+        int dst = <%pool_location%> == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
+        CUDA_TRY(cudaMemAdvise(ptr, bytes, cudaMemAdviseSetPreferredLocation, dst));
+    }
+    if (<%pool_accessed_by%> != cudaMemLocationTypeInvalid) {
+        int dst = <%pool_accessed_by%> == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
+        CUDA_TRY(cudaMemAdvise(ptr, bytes, cudaMemAdviseSetAccessedBy, dst));
+    }
+    if (<%pool_prefetch%> != cudaMemLocationTypeInvalid) {
+        int dst = <%pool_prefetch%> == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
+        CUDA_TRY(cudaMemPrefetchAsync(ptr, bytes, dst));
+    }
 
     if (bytes > size_t{128*1024*1024}) fprintf(stderr, "Info: allocated %llu\\n", (unsigned long long)bytes);
     return ptr;
@@ -191,12 +214,41 @@ static void __attribute__((destructor)) finalize() {
 
 void* custom_alloc(ssize_t size, int device, cudaStream_t stream) {
   auto* mr = rmm::mr::get_per_device_resource(rmm::cuda_device_id{device});
-  return mr->allocate(size, rmm::cuda_stream_view{stream});
+  auto* ptr = mr->allocate(size, rmm::cuda_stream_view{stream});
+  if (location != cudaMemLocationTypeInvalid || accessed_by != cudaMemLocationTypeInvalid || prefetch != cudaMemLocationTypeInvalid) {
+    // advise/prefetch should always be aligned to 2MB here
+    static constexpr ssize_t MIN_ALIGN = 1 << 21;
+    auto start_ptr = (reinterpret_cast<size_t>(ptr) / MIN_ALIGN) * MIN_ALIGN;
+    auto end_ptr = reinterpret_cast<size_t>(ptr) + size;
+    end_ptr = ((end_ptr + MIN_ALIGN - 1) / MIN_ALIGN) * MIN_ALIGN;
+    if (COND_UNLIKELY(location != cudaMemLocationTypeInvalid)) {
+        int dst = location == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
+        CUDA_TRY(cudaMemAdvise(reinterpret_cast<void*>(start_ptr), end_ptr - start_ptr, cudaMemAdviseSetPreferredLocation, dst));
+    }
+    if (COND_UNLIKELY(accessed_by != cudaMemLocationTypeInvalid)) {
+        int dst = accessed_by == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
+        CUDA_TRY(cudaMemAdvise(reinterpret_cast<void*>(start_ptr), end_ptr - start_ptr, cudaMemAdviseSetAccessedBy, dst));
+    }
+    if (COND_UNLIKELY(prefetch != cudaMemLocationTypeInvalid)) {
+        int dst = prefetch == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
+        CUDA_TRY(cudaMemPrefetchAsync(reinterpret_cast<void*>(start_ptr), end_ptr - start_ptr, dst));
+    }
+  }
+  return ptr;
 }
+
 void custom_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
   auto* mr = rmm::mr::get_per_device_resource(rmm::cuda_device_id{device});
   mr->deallocate(ptr, size, rmm::cuda_stream_view{stream});
 }
+
+int get_location() { return static_cast<int>(location); }
+int get_accessed_by() { return static_cast<int>(accessed_by); }
+int get_prefetch() { return static_cast<int>(prefetch); }
+void set_location(int value) { location = static_cast<enum cudaMemLocationType>(value); }
+void set_accessed_by(int value) { accessed_by = static_cast<enum cudaMemLocationType>(value); }
+void set_prefetch(int value) { prefetch = static_cast<enum cudaMemLocationType>(value); }
+
 }
 """
 
@@ -604,15 +656,19 @@ void custom_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
 
 class CustomTorchAllocator(torch.cuda.memory.CUDAPluggableAllocator):
     def __init__(self, alloc_type, initial_pool_size=1024 * 1024,
-                 max_pool_size=1024 * 1024 * 1024):
+                 max_pool_size=1024 * 1024 * 1024,
+                 pool_location=DeviceType.DEFAULT,
+                 pool_accessed_by=DeviceType.DEFAULT,
+                 pool_prefetch=DeviceType.DEFAULT):
         assert alloc_type.lower() in VALID_TYPES,\
             f"Invalid allocator type {alloc_type}"
         self.cpp_file = tempfile.mkstemp(suffix=os.extsep + "cpp", text=True)
         self.so_file = tempfile.mkstemp(suffix=os.extsep + "so")
+        self.alloc = self.so_file[1]
         dummy = cpp_extension.CUDAExtension("dummy", [])
         cmd = [
             "g++", "-shared", "-fPIC", "-std=c++17", "-lcudart", "-DNDEBUG",
-            "-o", self.so_file[1]
+            "-o", self.alloc
         ]
         cmd.extend(f"-I{x}" for x in dummy.include_dirs)
         cmd.extend(f"-L{x}" for x in dummy.library_dirs)
@@ -620,7 +676,10 @@ class CustomTorchAllocator(torch.cuda.memory.CUDAPluggableAllocator):
         if "rmm" in alloc_type.lower():
             kwargs = {
                 "initial_pool_size": f"{initial_pool_size}ULL",
-                "max_pool_size": f"{max_pool_size}ULL"
+                "max_pool_size": f"{max_pool_size}ULL",
+                "pool_location": pool_location.value[1],
+                "pool_accessed_by": pool_accessed_by.value[1],
+                "pool_prefetch": pool_prefetch.value[1],
             }
             # escape braces, then replace the alternate braces with actual ones
             src = src.replace("{", "{{").replace("}", "}}")
@@ -631,7 +690,7 @@ class CustomTorchAllocator(torch.cuda.memory.CUDAPluggableAllocator):
             f.write(src)
         cmd.append(self.cpp_file[1])
         subprocess.check_call(" ".join(cmd), shell=True)
-        super().__init__(self.so_file[1], "custom_alloc", "custom_free")
+        super().__init__(self.alloc, "custom_alloc", "custom_free")
 
     def teardown(self):
         # attempt to actually close / unload the library
@@ -645,21 +704,65 @@ class CustomTorchAllocator(torch.cuda.memory.CUDAPluggableAllocator):
                 stdlib = ctypes.CDLL("libc.so")
             dll_close = stdlib.dlclose
             dll_close.argtypes = [ctypes.c_void_p]
-            lib = ctypes.CDLL(self.so_file[1])
+            lib = ctypes.CDLL(self.alloc)
             dll_close(lib._handle)
 
     def __del__(self):
         try:
-            os.remove(self.so_file[1])
+            os.remove(self.alloc)
         except Exception:
             pass
         try:
-            os.remove(self.cpp_file[1])
+            os.remove(self.alloc)
         except Exception:
             pass
 
+    @contextmanager
+    def use(self,
+            location=DeviceType.DEFAULT,
+            accessed_by=DeviceType.DEFAULT,
+            prefetch=DeviceType.DEFAULT):
+        # get current values
+        cdll = ctypes.CDLL(self.alloc)
+        current_values = []
+        for kind, val in [
+                    ("location", location),
+                    ("accessed_by", accessed_by),
+                    ("prefetch", prefetch)
+                ]:
+            get_func = getattr(cdll, "get_" + kind)
+            get_func.restype = ctypes.c_int
+            get_func.argtypes = []
+            set_func = getattr(cdll, "set_" + kind)
+            set_func.restype = None
+            set_func.argtypes = [ctypes.c_int]
+            # record current value
+            current_val = get_func()
+            # apply new value
+            set_func(val.value[0])
+            current_values.append((set_func, current_val))
+
+        try:
+            yield self.alloc
+        finally:
+            # reset old values
+            for set_func, current_val in current_values:
+                set_func(current_val)
+
+
 def setup_allocator(train_config):
     alloc_type = (train_config.alloc_type or "").lower()
+    class DummyAllocator(object):
+        def __init__(self, alloc=None):
+            self.alloc = alloc
+
+        @contextmanager
+        def use(self,
+                location=DeviceType.DEFAULT,
+                accessed_by=DeviceType.DEFAULT,
+                prefetch=DeviceType.DEFAULT):
+            yield self.alloc
+
     if alloc_type == "rmm":
         # important: cannot use torch.cuda.current_device() to get the current
         # device since that actually initializes torch's CUDA state including
@@ -674,20 +777,23 @@ def setup_allocator(train_config):
             maximum_pool_size=train_config.alloc_max_pool_size,
             devices=[device]
         )
-        allocator = rmm_torch_allocator
+        allocator = DummyAllocator(rmm_torch_allocator)
     elif alloc_type.startswith("sam_"):
         print(f"Setting up custom allocator {alloc_type}")
         allocator = CustomTorchAllocator(
             alloc_type,
             initial_pool_size=train_config.alloc_initial_pool_size,
-            max_pool_size=train_config.alloc_max_pool_size
+            max_pool_size=train_config.alloc_max_pool_size,
+            pool_location=DeviceType.getattr(train_config.pool_location.upper()),
+            pool_accessed_by=DeviceType.getattr(train_config.pool_accessed_by.upper()),
+            pool_prefetch=DeviceType.getattr(train_config.pool_prefetch.upper())
         )
     elif alloc_type:
         raise ValueError(f"Unexpected allocator type {alloc_type}")
     else:
-        allocator = None
+        allocator = DummyAllocator()
 
-    if allocator is not None:
+    if allocator.alloc is not None:
         torch.cuda.memory.change_current_allocator(allocator)
         print(f"Allocator {alloc_type} set up")
     return allocator

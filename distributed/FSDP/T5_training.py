@@ -22,7 +22,7 @@ import policies
 import model_checkpointing
 from configs import fsdp_config, train_config
 from utils import (bfloat_support, setup, setup_allocator, teardown_allocator,
-                   cleanup, get_date_of_run,
+                   DeviceType, cleanup, get_date_of_run,
                    train, validation, setup_model)
 import time
 
@@ -59,19 +59,31 @@ def get_policies(cfg, rank):
 
 # TODO check if we can make this work. the gradients would also need to be pinned to device (maybe with pack/unpack hooks) !
 def model_pin_device(model):
+    sys_page_size = os.sysconf('SC_PAGE_SIZE')
+    libc_tunables = os.getenv('GLIBC_TUNABLES', f'glibc.malloc.top_pad={sys_page_size}')
+    libc_tunables = {x.split('=')[0]: int(x.split('=')[-1]) for x in libc_tunables.split(':')}
+    malloc_pad = libc_tunables['glibc.malloc.top_pad']
+    print(f"Using malloc pad {malloc_pad}")
+    def round_down(x): return (x // malloc_pad) * malloc_pad
+    def round_up(x): return ((x + malloc_pad - 1) // malloc_pad) * malloc_pad
+
     for p in model.parameters():
-        status = cudart.cudaMemAdvise(
-            p.data_ptr(), p.element_size() * p.nelement(),
-            cudart.cudaMemoryAdvise.cudaMemAdviseSetPreferredLocation, 0
-        )
-        assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0]) + " for " + str(p) + " size " + str(p.element_size() * p.nelement())
+        # use the default stream (cudaMemAdvise has that implicitly)
+        stream = 0
+        ptr_start = round_down(p.data_ptr())
+        ptr_end = round_up(p.data_ptr() + p.element_size() * p.nelement())
         status = cudart.cudaMemPrefetchAsync(
-            p.data_ptr(), p.element_size() * p.nelement(), 0, 0
+            ptr_start, ptr_end - ptr_start, p.device.index, stream
+        )
+        assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0]) + " for " + str(p) + " size " + str(p.element_size() * p.nelement())
+        status = cudart.cudaMemAdvise(
+            ptr_start, ptr_end - ptr_start,
+            cudart.cudaMemoryAdvise.cudaMemAdviseSetPreferredLocation, p.device.index
         )
         assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0]) + " for " + str(p) + " size " + str(p.element_size() * p.nelement())
 
 
-def fsdp_main(model_kwargs, alloc_type):
+def fsdp_main(model_kwargs, alloc_args):
     allocator = setup_allocator(train_config)
 
     torch.manual_seed(train_config.seed)
@@ -132,9 +144,8 @@ def fsdp_main(model_kwargs, alloc_type):
             policies.apply_fsdp_checkpointing(model)
     else:
         # move model to the GPU
-        model = model.to(device=torch.cuda.current_device())
-        if alloc_type.lower() == "sam_rmm_cpu":
-            model_pin_device(model)
+        with allocator.use(prefetch=DeviceType.DEVICE):
+            model = model.to(device=torch.cuda.current_device())
 
     # Set up optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=train_config.lr)
@@ -203,8 +214,8 @@ def fsdp_main(model_kwargs, alloc_type):
             print(f"Max memory reserved: {max(mem_reserved_tracker) / 1e9:.2f} GB, max memory allocated: {max(mem_alloc_tracker) / 1e9:.2f} GB")
 
     dist.barrier()
-    teardown_allocator(allocator)
     cleanup()
+    teardown_allocator(allocator)
 
 
 if __name__ == '__main__':
@@ -236,6 +247,9 @@ if __name__ == '__main__':
     parser.add_argument("--alloc_type", default=None)
     parser.add_argument("--alloc_max_pool_size", type=int, default=None)
     parser.add_argument("--max_steps_per_epoch", type=int, default=None)
+    parser.add_argument("--pool_location", default="default")
+    parser.add_argument("--pool_accessed_by", default="default")
+    parser.add_argument("--pool_prefetch", default="default")
     args = parser.parse_args()
 
     model_kwargs = {
@@ -256,7 +270,8 @@ if __name__ == '__main__':
         (fsdp_config, ["fsdp_activation_checkpointing", "cpu_offload"]),
         (train_config, [
             "model_name", "batch_size_training", "alloc_type",
-            "alloc_max_pool_size", "max_steps_per_epoch"
+            "alloc_max_pool_size", "max_steps_per_epoch", "pool_location",
+            "pool_accessed_by", "pool_prefetch"
         ])
     ]
     for group, arg_keys in group_args:
@@ -281,4 +296,4 @@ if __name__ == '__main__':
     if 'MASTER_PORT' not in os.environ:
         os.environ['MASTER_PORT'] = '29400'
 
-    fsdp_main(model_kwargs, train_config.alloc_type)
+    fsdp_main(model_kwargs)
