@@ -6,7 +6,7 @@ from datetime import datetime
 import tqdm
 from transformers import AutoTokenizer, GPT2TokenizerFast
 from transformers import T5Tokenizer, T5ForConditionalGeneration, T5Config
-from allocator import DeviceType
+from .allocator import DeviceType
 
 def setup():
     # initialize the process group

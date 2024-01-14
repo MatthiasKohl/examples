@@ -216,6 +216,8 @@ void* custom_alloc(ssize_t size, int device, cudaStream_t stream) {
   auto* mr = rmm::mr::get_per_device_resource(rmm::cuda_device_id{device});
   auto* ptr = mr->allocate(size, rmm::cuda_stream_view{stream});
   if (location != cudaMemLocationTypeInvalid || accessed_by != cudaMemLocationTypeInvalid || prefetch != cudaMemLocationTypeInvalid) {
+    // make sure that device context is set
+    CUDA_TRY(cudaSetDevice(device));
     // advise/prefetch should always be aligned to 2MB here
     static constexpr ssize_t MIN_ALIGN = 1 << 21;
     auto start_ptr = (reinterpret_cast<size_t>(ptr) / MIN_ALIGN) * MIN_ALIGN;
