@@ -222,14 +222,17 @@ void* custom_alloc(ssize_t size, int device, cudaStream_t stream) {
     auto end_ptr = reinterpret_cast<size_t>(ptr) + size;
     end_ptr = ((end_ptr + MIN_ALIGN - 1) / MIN_ALIGN) * MIN_ALIGN;
     if (COND_UNLIKELY(location != cudaMemLocationTypeInvalid)) {
+        //printf("alloc: location %d for %llu bytes\\n", int(location), (unsigned long long)size);
         int dst = location == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
         CUDA_TRY(cudaMemAdvise(reinterpret_cast<void*>(start_ptr), end_ptr - start_ptr, cudaMemAdviseSetPreferredLocation, dst));
     }
     if (COND_UNLIKELY(accessed_by != cudaMemLocationTypeInvalid)) {
+        //printf("alloc: accessed_by %d for %llu bytes\\n", int(accessed_by), (unsigned long long)size);
         int dst = accessed_by == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
         CUDA_TRY(cudaMemAdvise(reinterpret_cast<void*>(start_ptr), end_ptr - start_ptr, cudaMemAdviseSetAccessedBy, dst));
     }
     if (COND_UNLIKELY(prefetch != cudaMemLocationTypeInvalid)) {
+        //printf("alloc: prefetch %d for %llu bytes\\n", int(prefetch), (unsigned long long)size);
         int dst = prefetch == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
         CUDA_TRY(cudaMemPrefetchAsync(reinterpret_cast<void*>(start_ptr), end_ptr - start_ptr, dst));
     }
@@ -784,9 +787,9 @@ def setup_allocator(train_config):
             alloc_type,
             initial_pool_size=train_config.alloc_initial_pool_size,
             max_pool_size=train_config.alloc_max_pool_size,
-            pool_location=DeviceType.getattr(train_config.pool_location.upper()),
-            pool_accessed_by=DeviceType.getattr(train_config.pool_accessed_by.upper()),
-            pool_prefetch=DeviceType.getattr(train_config.pool_prefetch.upper())
+            pool_location=getattr(DeviceType, train_config.pool_location.upper()),
+            pool_accessed_by=getattr(DeviceType, train_config.pool_accessed_by.upper()),
+            pool_prefetch=getattr(DeviceType, train_config.pool_prefetch.upper())
         )
     elif alloc_type:
         raise ValueError(f"Unexpected allocator type {alloc_type}")

@@ -83,7 +83,7 @@ def model_pin_device(model):
         assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0]) + " for " + str(p) + " size " + str(p.element_size() * p.nelement())
 
 
-def fsdp_main(model_kwargs, alloc_args):
+def fsdp_main(model_kwargs):
     allocator = setup_allocator(train_config)
 
     torch.manual_seed(train_config.seed)
@@ -168,7 +168,7 @@ def fsdp_main(model_kwargs, alloc_args):
     for epoch in range(1, train_config.epochs + 1):
         torch.cuda.nvtx.range_push(f"EP {epoch}")
         t0 = time.time()
-        train_accuracy = train(train_config, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
+        train_accuracy = train(train_config, allocator, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
         train_time = time.time() - t0
         if train_config.run_validation:
             curr_val_loss = validation(model, rank, world_size, val_loader)
