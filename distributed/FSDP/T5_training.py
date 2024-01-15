@@ -114,7 +114,7 @@ def fsdp_main(model_kwargs):
             # we're already in the block for backward, just prefetch gradients
             # of this block
             for p in block.parameters():
-                if p.grad:
+                if p.grad is not None:
                     prefetch_to(p.grad, p.grad.device.index)
         else:
             # prefetch parameters of next block
@@ -130,20 +130,20 @@ def fsdp_main(model_kwargs):
             # TODO potentially use different stream
             for p in next_block.parameters():
                 prefetch_to(p, cudart.cudaCpuDeviceId)
-                if p.grad:
+                if p.grad is not None:
                     prefetch_to(p.grad, cudart.cudaCpuDeviceId)
         if prev_block is None:
             # need to bring in all parameters and gradients to device for optimizer
             for block in layer_map.keys():
                 for p in block.parameters():
                     prefetch_to(p, p.device.index)
-                    if p.grad:
+                    if p.grad is not None:
                         prefetch_to(p.grad, p.grad.device.index)
         else:
             # move parameters and gradients of previous block to device
             for p in prev_block.parameters():
                 prefetch_to(p, p.device.index)
-                if p.grad:
+                if p.grad is not None:
                     prefetch_to(p.grad, p.grad.device.index)
 
     for main_stack in ["encoder", "decoder"]:

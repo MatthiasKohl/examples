@@ -670,11 +670,11 @@ class CustomTorchAllocator(torch.cuda.memory.CUDAPluggableAllocator):
             f"Invalid allocator type {alloc_type}"
         self.cpp_file = tempfile.mkstemp(suffix=os.extsep + "cpp", text=True)
         self.so_file = tempfile.mkstemp(suffix=os.extsep + "so")
-        self.alloc = self.so_file[1]
+        self.alloc = self
         dummy = cpp_extension.CUDAExtension("dummy", [])
         cmd = [
             "g++", "-shared", "-fPIC", "-std=c++17", "-lcudart", "-DNDEBUG",
-            "-o", self.alloc
+            "-o", self.so_file[1]
         ]
         cmd.extend(f"-I{x}" for x in dummy.include_dirs)
         cmd.extend(f"-L{x}" for x in dummy.library_dirs)
@@ -696,7 +696,7 @@ class CustomTorchAllocator(torch.cuda.memory.CUDAPluggableAllocator):
             f.write(src)
         cmd.append(self.cpp_file[1])
         subprocess.check_call(" ".join(cmd), shell=True)
-        super().__init__(self.alloc, "custom_alloc", "custom_free")
+        super().__init__(self.so_file[1], "custom_alloc", "custom_free")
 
     def teardown(self):
         # attempt to actually close / unload the library
@@ -710,16 +710,16 @@ class CustomTorchAllocator(torch.cuda.memory.CUDAPluggableAllocator):
                 stdlib = ctypes.CDLL("libc.so")
             dll_close = stdlib.dlclose
             dll_close.argtypes = [ctypes.c_void_p]
-            lib = ctypes.CDLL(self.alloc)
+            lib = ctypes.CDLL(self.so_file[1])
             dll_close(lib._handle)
 
     def __del__(self):
         try:
-            os.remove(self.alloc)
+            os.remove(self.so_file[1])
         except Exception:
             pass
         try:
-            os.remove(self.alloc)
+            os.remove(self.so_file[1])
         except Exception:
             pass
 
@@ -729,7 +729,7 @@ class CustomTorchAllocator(torch.cuda.memory.CUDAPluggableAllocator):
             accessed_by=DeviceType.DEFAULT,
             prefetch=DeviceType.DEFAULT):
         # get current values
-        cdll = ctypes.CDLL(self.alloc)
+        cdll = ctypes.CDLL(self.so_file[1])
         current_values = []
         for kind, val in [
                     ("location", location),
@@ -749,7 +749,7 @@ class CustomTorchAllocator(torch.cuda.memory.CUDAPluggableAllocator):
             current_values.append((set_func, current_val))
 
         try:
-            yield self.alloc
+            yield self
         finally:
             # reset old values
             for set_func, current_val in current_values:
@@ -800,7 +800,7 @@ def setup_allocator(train_config):
         allocator = DummyAllocator()
 
     if allocator.alloc is not None:
-        torch.cuda.memory.change_current_allocator(allocator)
+        torch.cuda.memory.change_current_allocator(allocator.alloc)
         print(f"Allocator {alloc_type} set up")
     return allocator
 
