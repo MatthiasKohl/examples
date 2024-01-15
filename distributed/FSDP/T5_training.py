@@ -133,12 +133,13 @@ def fsdp_main(model_kwargs):
                 if p.grad is not None:
                     prefetch_to(p.grad, cudart.cudaCpuDeviceId)
         if prev_block is None:
-            # need to bring in all parameters and gradients to device for optimizer
-            for block in layer_map.keys():
-                for p in block.parameters():
-                    prefetch_to(p, p.device.index)
-                    if p.grad is not None:
-                        prefetch_to(p.grad, p.grad.device.index)
+            # # need to bring in all parameters and gradients to device for optimizer
+            # for block in layer_map.keys():
+            #     for p in block.parameters():
+            #         prefetch_to(p, p.device.index)
+            #         if p.grad is not None:
+            #             prefetch_to(p.grad, p.grad.device.index)
+            pass
         else:
             # move parameters and gradients of previous block to device
             for p in prev_block.parameters():
@@ -146,16 +147,17 @@ def fsdp_main(model_kwargs):
                 if p.grad is not None:
                     prefetch_to(p.grad, p.grad.device.index)
 
-    for main_stack in ["encoder", "decoder"]:
-        if not hasattr(model, main_stack):
-            continue
-        stack = getattr(model, main_stack)
-        for i, block in enumerate(stack.block):
-            layer_map[block] = layer_id + i
-            layer_id_map[layer_id + i] = block
-            block.register_forward_pre_hook(block_pre_hook)
-            block.register_full_backward_pre_hook(block_bw_pre_hook)
-        layer_id += len(stack.block)
+    if train_config.alloc_type.lower() == "sam_rmm":
+        for main_stack in ["encoder", "decoder"]:
+            if not hasattr(model, main_stack):
+                continue
+            stack = getattr(model, main_stack)
+            for i, block in enumerate(stack.block):
+                layer_map[block] = layer_id + i
+                layer_id_map[layer_id + i] = block
+                block.register_forward_pre_hook(block_pre_hook)
+                block.register_full_backward_pre_hook(block_bw_pre_hook)
+            layer_id += len(stack.block)
 
     # TODO prefetch idea: model should be T5Model, containing encoder and decoder (both T5Stack), containing T5Block s
     # default, everything on host
