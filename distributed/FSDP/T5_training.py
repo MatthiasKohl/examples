@@ -28,6 +28,16 @@ import time
 
 from cuda import cudart
 
+PAGE_SIZE = os.sysconf('SC_PAGE_SIZE')
+LIBC_TUNABLES = os.getenv('GLIBC_TUNABLES', f'glibc.malloc.top_pad={PAGE_SIZE}')
+LIBC_TUNABLES = {x.split('=')[0]: int(x.split('=')[-1]) for x in LIBC_TUNABLES.split(':')}
+MALLOC_PAD = LIBC_TUNABLES['glibc.malloc.top_pad']
+
+
+def ptr_round_down(x): return (x // MALLOC_PAD) * MALLOC_PAD
+def ptr_round_up(x): return ((x + MALLOC_PAD - 1) // MALLOC_PAD) * MALLOC_PAD
+
+
 def get_policies(cfg, rank):
 
     """establish current policies for mixed precision and fsdp wrapping"""
@@ -57,30 +67,30 @@ def get_policies(cfg, rank):
     return mixed_precision_policy, wrapping_policy
 
 
-# TODO check if we can make this work. the gradients would also need to be pinned to device (maybe with pack/unpack hooks) !
-def model_pin_device(model):
-    sys_page_size = os.sysconf('SC_PAGE_SIZE')
-    libc_tunables = os.getenv('GLIBC_TUNABLES', f'glibc.malloc.top_pad={sys_page_size}')
-    libc_tunables = {x.split('=')[0]: int(x.split('=')[-1]) for x in libc_tunables.split(':')}
-    malloc_pad = libc_tunables['glibc.malloc.top_pad']
-    print(f"Using malloc pad {malloc_pad}")
-    def round_down(x): return (x // malloc_pad) * malloc_pad
-    def round_up(x): return ((x + malloc_pad - 1) // malloc_pad) * malloc_pad
+def prefetch_to(t, device):
+    stream = torch.cuda.current_stream().cuda_stream
 
-    for p in model.parameters():
-        # use the default stream (cudaMemAdvise has that implicitly)
-        stream = 0
-        ptr_start = round_down(p.data_ptr())
-        ptr_end = round_up(p.data_ptr() + p.element_size() * p.nelement())
-        status = cudart.cudaMemPrefetchAsync(
-            ptr_start, ptr_end - ptr_start, p.device.index, stream
-        )
-        assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0]) + " for " + str(p) + " size " + str(p.element_size() * p.nelement())
-        status = cudart.cudaMemAdvise(
-            ptr_start, ptr_end - ptr_start,
-            cudart.cudaMemoryAdvise.cudaMemAdviseSetPreferredLocation, p.device.index
-        )
-        assert status[0] == cudart.cudaError_t.cudaSuccess, "cudart.cudaMemAdvise failed with " + repr(status[0]) + " for " + str(p) + " size " + str(p.element_size() * p.nelement())
+    ptr_start = ptr_round_down(t.data_ptr())
+    ptr_end = ptr_round_up(t.data_ptr() + t.element_size() * t.nelement())
+    n_bytes = ptr_end - ptr_start
+    status = cudart.cudaMemPrefetchAsync(ptr_start, n_bytes, device, stream)
+    assert status[0] == cudart.cudaError_t.cudaSuccess,\
+        ("cudart.cudaMemPrefetchAsync failed with " + repr(status[0]) + " for " +
+         str(t) + " and device " + str(device) + ", ptr " + str(t.data_ptr()) +
+         " / size " + str(t.element_size() * t.nelement()) + ", rounded ptr " +
+         str(ptr_start) + " / rounded size " + str(n_bytes))
+
+
+# TODO: should associate each tensor with a block and only prefetch to CPU
+# if not last block, then use the hook to prefetch back to device, do nothing in unpack_hook
+def pack_hook(t):
+    prefetch_to(t, cudart.cudaCpuDeviceId)
+    return t
+
+
+def unpack_hook(t):
+    prefetch_to(t, t.device.index)
+    return t
 
 
 def fsdp_main(model_kwargs):
@@ -89,6 +99,72 @@ def fsdp_main(model_kwargs):
     torch.manual_seed(train_config.seed)
 
     model, tokenizer = setup_model(train_config.model_name, **model_kwargs)
+    # get a mapping from layer ID to T5Block in order to add prefetching hooks
+    layer_id, layer_map, layer_id_map = 0, {}, {}
+    def block_pre_hook(block, args):
+        i = layer_map[block]
+        prev_block = layer_id_map.get(i - 1, None)
+        next_block = layer_id_map.get(i + 1, None)
+        if prev_block is not None and next_block is not None:
+            # move parameters of previous block back to CPU
+            # TODO use a separate stream for this (issue is sync)
+            for p in prev_block.parameters():
+                prefetch_to(p, cudart.cudaCpuDeviceId)
+        if next_block is None:
+            # we're already in the block for backward, just prefetch gradients
+            # of this block
+            for p in block.parameters():
+                if p.grad:
+                    prefetch_to(p.grad, p.grad.device.index)
+        else:
+            # prefetch parameters of next block
+            for p in next_block.parameters():
+                prefetch_to(p, p.device.index)
+
+    def block_bw_pre_hook(block, grad_output):
+        i = layer_map[block]
+        prev_block = layer_id_map.get(i - 1, None)
+        next_block = layer_id_map.get(i + 1, None)
+        if next_block is not None and prev_block is not None:
+            # move parameters and gradients of next block back to CPU
+            # TODO potentially use different stream
+            for p in next_block.parameters():
+                prefetch_to(p, cudart.cudaCpuDeviceId)
+                if p.grad:
+                    prefetch_to(p.grad, cudart.cudaCpuDeviceId)
+        if prev_block is None:
+            # need to bring in all parameters and gradients to device for optimizer
+            for block in layer_map.keys():
+                for p in block.parameters():
+                    prefetch_to(p, p.device.index)
+                    if p.grad:
+                        prefetch_to(p.grad, p.grad.device.index)
+        else:
+            # move parameters and gradients of previous block to device
+            for p in prev_block.parameters():
+                prefetch_to(p, p.device.index)
+                if p.grad:
+                    prefetch_to(p.grad, p.grad.device.index)
+
+    for main_stack in ["encoder", "decoder"]:
+        if not hasattr(model, main_stack):
+            continue
+        stack = getattr(model, main_stack)
+        for i, block in enumerate(stack.block):
+            layer_map[block] = layer_id + i
+            layer_id_map[layer_id + i] = block
+            block.register_forward_pre_hook(block_pre_hook)
+            block.register_full_backward_pre_hook(block_bw_pre_hook)
+        layer_id += len(stack.block)
+
+    # TODO prefetch idea: model should be T5Model, containing encoder and decoder (both T5Stack), containing T5Block s
+    # default, everything on host
+    # then prefetch params of first block here to device.
+    # Add forward hook to block to prefetch next block params before forward of current block
+    # in hook of last layer, prefetch gradients of last layer (unclear if possible, but should work)
+    # then in backward hook, prefetch params+gradients of previous block before backward of current block
+    # in backward hook of first block, nothing needs to be done
+    # mainly need to figure out how to get ID of block from these hooks, probably just a dict of module object to ID
 
     local_rank = int(os.environ['LOCAL_RANK'])
     rank = int(os.environ['RANK'])
@@ -144,8 +220,7 @@ def fsdp_main(model_kwargs):
             policies.apply_fsdp_checkpointing(model)
     else:
         # move model to the GPU
-        with allocator.use(prefetch=DeviceType.DEVICE):
-            model = model.to(device=torch.cuda.current_device())
+        model = model.to(device=torch.cuda.current_device())
 
     # Set up optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=train_config.lr)
@@ -168,7 +243,7 @@ def fsdp_main(model_kwargs):
     for epoch in range(1, train_config.epochs + 1):
         torch.cuda.nvtx.range_push(f"EP {epoch}")
         t0 = time.time()
-        train_accuracy = train(train_config, allocator, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
+        train_accuracy = train(train_config, model, rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
         train_time = time.time() - t0
         if train_config.run_validation:
             curr_val_loss = validation(model, rank, world_size, val_loader)

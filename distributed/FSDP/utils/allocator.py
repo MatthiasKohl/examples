@@ -215,6 +215,7 @@ static void __attribute__((destructor)) finalize() {
 void* custom_alloc(ssize_t size, int device, cudaStream_t stream) {
   auto* mr = rmm::mr::get_per_device_resource(rmm::cuda_device_id{device});
   auto* ptr = mr->allocate(size, rmm::cuda_stream_view{stream});
+  if (COND_UNLIKELY(ptr == nullptr || size == 0)) return ptr;
   if (location != cudaMemLocationTypeInvalid || accessed_by != cudaMemLocationTypeInvalid || prefetch != cudaMemLocationTypeInvalid) {
     // make sure that device context is set
     CUDA_TRY(cudaSetDevice(device));
@@ -224,17 +225,17 @@ void* custom_alloc(ssize_t size, int device, cudaStream_t stream) {
     auto end_ptr = reinterpret_cast<size_t>(ptr) + size;
     end_ptr = ((end_ptr + MIN_ALIGN - 1) / MIN_ALIGN) * MIN_ALIGN;
     if (COND_UNLIKELY(location != cudaMemLocationTypeInvalid)) {
-        //printf("alloc: location %d for %llu bytes\\n", int(location), (unsigned long long)size);
+        //printf("alloc: location %d for %llu bytes, ptr %p, page-aligned %p/%llu\\n", int(location), (unsigned long long)size, ptr, reinterpret_cast<void*>(start_ptr), (unsigned long long)(end_ptr - start_ptr));
         int dst = location == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
         CUDA_TRY(cudaMemAdvise(reinterpret_cast<void*>(start_ptr), end_ptr - start_ptr, cudaMemAdviseSetPreferredLocation, dst));
     }
     if (COND_UNLIKELY(accessed_by != cudaMemLocationTypeInvalid)) {
-        //printf("alloc: accessed_by %d for %llu bytes\\n", int(accessed_by), (unsigned long long)size);
+        //printf("alloc: accessed_by %d for %llu bytes, ptr %p, page-aligned %p/%llu\\n", int(accessed_by), (unsigned long long)size, ptr, reinterpret_cast<void*>(start_ptr), (unsigned long long)(end_ptr - start_ptr));
         int dst = accessed_by == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
         CUDA_TRY(cudaMemAdvise(reinterpret_cast<void*>(start_ptr), end_ptr - start_ptr, cudaMemAdviseSetAccessedBy, dst));
     }
     if (COND_UNLIKELY(prefetch != cudaMemLocationTypeInvalid)) {
-        //printf("alloc: prefetch %d for %llu bytes\\n", int(prefetch), (unsigned long long)size);
+        //printf("alloc: prefetch %d for %llu bytes, ptr %p, page-aligned %p/%llu\\n", int(prefetch), (unsigned long long)size, ptr, reinterpret_cast<void*>(start_ptr), (unsigned long long)(end_ptr - start_ptr));
         int dst = prefetch == cudaMemLocationTypeDevice ? device : cudaCpuDeviceId;
         CUDA_TRY(cudaMemPrefetchAsync(reinterpret_cast<void*>(start_ptr), end_ptr - start_ptr, dst));
     }

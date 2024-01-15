@@ -6,7 +6,6 @@ from datetime import datetime
 import tqdm
 from transformers import AutoTokenizer, GPT2TokenizerFast
 from transformers import T5Tokenizer, T5ForConditionalGeneration, T5Config
-from .allocator import DeviceType
 
 def setup():
     # initialize the process group
@@ -23,7 +22,7 @@ def get_date_of_run():
     print(f"--> current date and time of run = {date_of_run}")
     return date_of_run
 
-def train(args, allocator, model, rank, world_size, train_loader, optimizer, epoch, sampler=None):
+def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler=None):
     model.train()
     local_rank = int(os.environ['LOCAL_RANK'])
     fsdp_loss = torch.zeros(2).to(local_rank)
@@ -47,13 +46,12 @@ def train(args, allocator, model, rank, world_size, train_loader, optimizer, epo
         output = model(input_ids=batch["source_ids"],attention_mask=batch["source_mask"],labels=batch["target_ids"] )
         loss = output["loss"]
         torch.cuda.nvtx.range_pop()
-        with allocator.use(location=DeviceType.DEVICE, prefetch=DeviceType.DEVICE):
-            torch.cuda.nvtx.range_push(f"backward")
-            loss.backward()
-            torch.cuda.nvtx.range_pop()
-            torch.cuda.nvtx.range_push(f"opt")
-            optimizer.step()
-            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push(f"backward")
+        loss.backward()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push(f"opt")
+        optimizer.step()
+        torch.cuda.nvtx.range_pop()
         fsdp_loss[0] += loss.item()
         fsdp_loss[1] += len(batch)
         torch.cuda.nvtx.range_pop()
