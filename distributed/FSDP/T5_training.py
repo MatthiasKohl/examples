@@ -81,18 +81,6 @@ def prefetch_to(t, device):
          str(ptr_start) + " / rounded size " + str(n_bytes))
 
 
-# TODO: should associate each tensor with a block and only prefetch to CPU
-# if not last block, then use the hook to prefetch back to device, do nothing in unpack_hook
-def pack_hook(t):
-    prefetch_to(t, cudart.cudaCpuDeviceId)
-    return t
-
-
-def unpack_hook(t):
-    prefetch_to(t, t.device.index)
-    return t
-
-
 def fsdp_main(model_kwargs):
     allocator = setup_allocator(train_config)
 
@@ -101,6 +89,7 @@ def fsdp_main(model_kwargs):
     model, tokenizer = setup_model(train_config.model_name, **model_kwargs)
     # get a mapping from layer ID to T5Block in order to add prefetching hooks
     layer_id, layer_map, layer_id_map = 0, {}, {}
+    is_uvm = train_config.alloc_type.lower() == "sam_rmm"
     def block_pre_hook(block, args):
         i = layer_map[block]
         prev_block = layer_id_map.get(i - 1, None)
