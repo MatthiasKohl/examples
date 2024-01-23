@@ -108,17 +108,21 @@ class OffloadPostHook(torch.autograd.Function):
 
 
 class OffloadBlockWrapper(nn.Module):
-    def __init__(self, block, block_id, block_id_map, stream):
+    def __init__(self, block, block_id, block_id_map, stream, init_device):
         super().__init__()
-        self.block = block
+        self.block = block.to_empty(device=init_device)
         self.block_id = block_id
         self.id_map = block_id_map
         self.stream = stream
         self.packed_tensors = []
         # ensure that we have copies for both parameters and gradients
-        self.params = [(p, torch.empty_like(p, device="cpu", pin_memory=True))
-            for p in block.parameters()
+        self.params = [
+            (p, torch.empty_like(p, device="cpu", pin_memory=True))
+            for p in self.block.parameters()
         ]
+        if self.block_id > 0:
+            for p, _ in self.params:
+                _release_storage(p)
         self._unpack_warning_triggered = False
 
     def pack(self, t):
@@ -160,10 +164,11 @@ class OffloadBlockWrapper(nn.Module):
 
 
 class OffloadingWrapper(nn.Module):
-    def __init__(self, wrapped_module, block_type):
+    def __init__(self, wrapped_module, block_type, device=None):
         super().__init__()
         self.wrapped_module = wrapped_module
         self.block_type = block_type
+        self.device = device or torch.cuda.current_device()
         self.stream = torch.cuda.Stream()
         self.block_id_map = OrderedDict()
         block_id = 0
@@ -177,7 +182,7 @@ class OffloadingWrapper(nn.Module):
                         "Block type cannot be type of main wrapped module"
                     )
                 new_module = OffloadBlockWrapper(
-                    m, block_id, self.block_id_map, self.stream
+                    m, block_id, self.block_id_map, self.stream, device
                 )
                 setattr(parent, name, new_module)
                 self.block_id_map[block_id] = new_module
@@ -214,8 +219,7 @@ def main():
         TestBlock(hidden_size, hidden_size),
         TestBlock(hidden_size, out_size, act=None)
     )
-    model = OffloadingWrapper(model, TestBlock)
-    model.to(device=device)
+    model = OffloadingWrapper(model, TestBlock, device=device)
     _apply_optimizer_in_backward(
         torch.optim.AdamW,
         params=model.parameters(),

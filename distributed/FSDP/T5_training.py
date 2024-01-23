@@ -195,7 +195,9 @@ def fsdp_main(model_kwargs):
     torch.cuda.set_device(local_rank)
     
     # Apply FSDP wrapping to the model
-    if fsdp_config.enabled:
+    if fsdp_config.interleaved_offload:
+        model = OffloadBlockWrapper(mode, T5Block, device=torch.cuda.current_device())
+    elif fsdp_config.enabled:
         # Set up FSDP parameters
         mixed_precision_policy, t5_auto_wrap_policy = get_policies(train_config, rank)
         if fsdp_config.cpu_offload is None:
@@ -218,7 +220,6 @@ def fsdp_main(model_kwargs):
 
     # Set up optimizer and scheduler
     if fsdp_config.interleaved_offload:
-        model = OffloadingWrapper(model, T5Block)
         _apply_optimizer_in_backward(
             optim.AdamW, model.parameters(),
             optimizer_kwargs={"lr": train_config.lr}
