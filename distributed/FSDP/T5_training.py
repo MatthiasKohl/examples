@@ -196,7 +196,7 @@ def fsdp_main(model_kwargs):
     
     # Apply FSDP wrapping to the model
     if fsdp_config.interleaved_offload:
-        model = OffloadBlockWrapper(mode, T5Block, device=torch.cuda.current_device())
+        model = OffloadingWrapper(model, T5Block, device=torch.cuda.current_device())
     elif fsdp_config.enabled:
         # Set up FSDP parameters
         mixed_precision_policy, t5_auto_wrap_policy = get_policies(train_config, rank)

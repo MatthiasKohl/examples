@@ -172,24 +172,30 @@ class OffloadingWrapper(nn.Module):
         self.stream = torch.cuda.Stream()
         self.block_id_map = OrderedDict()
         block_id = 0
-        current_stack = [(wrapped_module, None, None)]
+        current_stack = [(
+            wrapped_module, None, None, isinstance(wrapped_module, block_type)
+        )]
         current_item = 0
         while current_item < len(current_stack):
-            m, name, parent = current_stack[current_item]
-            if isinstance(m, block_type):
+            m, name, parent, within_block = current_stack[current_item]
+            is_block = isinstance(m, block_type)
+            if is_block:
                 if parent is None:
                     raise ValueError(
                         "Block type cannot be type of main wrapped module"
                     )
                 new_module = OffloadBlockWrapper(
-                    m, block_id, self.block_id_map, self.stream, device
+                    m, block_id, self.block_id_map, self.stream, self.device
                 )
                 setattr(parent, name, new_module)
                 self.block_id_map[block_id] = new_module
                 block_id += 1
+            elif not within_block:
+                m._apply(lambda t: t.to(device=self.device), recurse=False)
             current_item += 1
             current_stack[current_item:current_item] = [
-                (child, name, m) for name, child in m.named_children()
+                (child, name, m, is_block or within_block)
+                for name, child in m.named_children()
             ]
 
     def forward(self, *args, **kwargs):
