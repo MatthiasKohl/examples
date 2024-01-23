@@ -28,6 +28,9 @@ import time
 
 from cuda import cudart
 
+from interleaved_offload import OffloadingWrapper, _apply_optimizer_in_backward
+from transformers.models.t5.modeling_t5 import T5Block
+
 PAGE_SIZE = os.sysconf('SC_PAGE_SIZE')
 LIBC_TUNABLES = os.getenv('GLIBC_TUNABLES', f'glibc.malloc.top_pad={PAGE_SIZE}')
 LIBC_TUNABLES = {x.split('=')[0]: int(x.split('=')[-1]) for x in LIBC_TUNABLES.split(':')}
@@ -214,9 +217,21 @@ def fsdp_main(model_kwargs):
         model = model.to(device=torch.cuda.current_device())
 
     # Set up optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=train_config.lr)
+    if fsdp_config.interleaved_offload:
+        model = OffloadingWrapper(model, T5Block)
+        _apply_optimizer_in_backward(
+            optim.AdamW, model.parameters(),
+            optimizer_kwargs={"lr": train_config.lr}
+        )
+        # TODO ideally, we should properly handle scheduler s.t. it combines
+        # all optimizers, and the optimizer given to other functions should
+        # also save state correctly
+        optimizer = next(model.parameters())._in_backward_optimizers[0]
+        scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=train_config.lr)
+        scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
 
-    scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
     best_val_loss = float("inf")
     curr_val_loss = float("inf")
     file_save_name = "T5-model-"
@@ -316,6 +331,7 @@ if __name__ == '__main__':
     parser.add_argument("--pool_location", default="default")
     parser.add_argument("--pool_accessed_by", default="default")
     parser.add_argument("--pool_prefetch", default="default")
+    parser.add_argument("--interleaved_offload", type=str2bool, default=None)
     args = parser.parse_args()
 
     model_kwargs = {
@@ -333,7 +349,11 @@ if __name__ == '__main__':
         )
         fsdp_config.enabled = args.use_fsdp
     group_args = [
-        (fsdp_config, ["fsdp_activation_checkpointing", "cpu_offload"]),
+        (fsdp_config, [
+            "fsdp_activation_checkpointing",
+            "cpu_offload",
+            "interleaved_offload"
+        ]),
         (train_config, [
             "model_name", "batch_size_training", "alloc_type",
             "alloc_max_pool_size", "max_steps_per_epoch", "pool_location",

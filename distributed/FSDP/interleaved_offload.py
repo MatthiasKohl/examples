@@ -24,7 +24,6 @@ class OffloadPreHook(torch.autograd.Function):
     def forward(offload_args, *args):
         # pre-forward
         stream, block, next_block, prev_block = offload_args
-        device = torch.cuda.current_device()
         stream.synchronize()
         with torch.cuda.stream(stream):
             with torch.no_grad():
@@ -83,7 +82,6 @@ class OffloadPostHook(torch.autograd.Function):
     def backward(ctx, *grad_args):
         # pre-backward
         stream, _, next_block, prev_block = ctx.offload_args
-        device = torch.cuda.current_device()
         # sync the stream to ensure that our parameters and gradients have
         # been brought in. This also ensure that we can delete the parameters
         # of the next_block (previous block in backward)
@@ -121,6 +119,7 @@ class OffloadBlockWrapper(nn.Module):
         self.params = [(p, torch.empty_like(p, device="cpu", pin_memory=True))
             for p in block.parameters()
         ]
+        self._unpack_warning_triggered = False
 
     def pack(self, t):
         if next(reversed(self.id_map)) == self.block_id or not t.is_cuda:
@@ -141,6 +140,10 @@ class OffloadBlockWrapper(nn.Module):
         # this should have already been moved back to device
         dev, t, cpu_t = self.packed_tensors[idx]
         if t is None:
+            if not self._unpack_warning_triggered:
+                print(f"OffloadBlockWrapper (block {self.block_id}): "
+                      "unpack requiring manual move to device")
+                self._unpack_warning_triggered = True
             return cpu_t.to(device=dev)
         return t
 
@@ -151,7 +154,7 @@ class OffloadBlockWrapper(nn.Module):
         args = OffloadPreHook.apply((self.stream, self, next_block, prev_block), *args)
         with torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack):
             args = self.block(*args, **kwargs)
-        args = args if type(args) in [list, tuple] else [args]
+        args = [args] if isinstance(args, torch.Tensor) else args
         outputs = OffloadPostHook.apply((self.stream, self, next_block, prev_block), *args)
         return outputs
 
@@ -216,16 +219,16 @@ def main():
     _apply_optimizer_in_backward(
         torch.optim.AdamW,
         params=model.parameters(),
-        optimizer_kwargs={"lr": 0.002}
+        optimizer_kwargs={"lr": 2.0}
     )
     loss = nn.CrossEntropyLoss()
 
-    for i in range(3):
-        # TODO need to check whether anything actually gets updated,
-        # doesn't seem like it for now !
-        print(f"iteration {i}")
-        print(next(model.wrapped_module.children()).params[0])
-        print(next(model.wrapped_module.children()).block.linear.weight)
+    for i in range(16):
+        print(f"iteration {i}", end=" ", flush=True)
+        # p_wrapped = next(model.wrapped_module.children()).params[0]
+        # p_linear = next(model.wrapped_module.children()).block.linear.weight
+        # print(p_wrapped[0] is p_linear)
+        # print(p_wrapped)
         torch.cuda.nvtx.range_push(f"IT {i}")
         inputs = torch.randn(batch_size, in_size, device=device)
         targets = torch.randint(0, out_size, size=(batch_size,), device=device)
@@ -238,7 +241,7 @@ def main():
         loss_value.backward()
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
-        print(f"iteration {i} done")
+        print(f"done")
 
 
 if __name__ == "__main__":

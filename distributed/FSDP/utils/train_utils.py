@@ -39,7 +39,7 @@ def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler
         for key in batch.keys():
             batch[key] = batch[key].to(local_rank)
         torch.cuda.nvtx.range_push(f"opt zero")
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_push(f"forward")
         # import pdb;pdb.set_trace()
