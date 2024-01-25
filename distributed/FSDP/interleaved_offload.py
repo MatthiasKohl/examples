@@ -36,6 +36,7 @@ def _recursive_tensors(x):
             pass
 
 
+# TODO further debugging why we get illegal mem access with the dirty approach
 class OffloadPreHook(torch.autograd.Function):
     @staticmethod
     def forward(block, *args):
@@ -46,10 +47,11 @@ class OffloadPreHook(torch.autograd.Function):
                 prev_block_act = block.id_map.get(block.block_id - block.num_blocks_act + 1)
                 if prev_block_act is not None:
                     # release storage of the packed tensors
-                    for i, key in enumerate(prev_block_act.packed_tensors):
+                    for key in prev_block_act.packed_tensors:
                         # only release if not dirty
-                        if not key in prev_block_act.dirty_tensors:
-                            _release_storage(prev_block_act.packed_tensors[key][0])
+                        if key in prev_block_act.dirty_tensors:
+                            continue
+                        _release_storage(prev_block_act.packed_tensors[key][0])
                 prev_block_p = block.id_map.get(block.block_id - block.num_blocks_params + 1)
                 if prev_block_p is not None:
                     for p, _ in prev_block_p.params:
@@ -87,15 +89,17 @@ class OffloadPreHook(torch.autograd.Function):
 
 class OffloadPostHook(torch.autograd.Function):
     @staticmethod
-    def forward(block, *args):
+    def forward(offload_args, *args):
         # post-forward
+        block, dirty_inputs = offload_args
         with torch.cuda.stream(block.stream):
             with torch.no_grad():
                 next_block_act = block.id_map.get(block.block_id + block.num_blocks_act - 1)
                 if next_block_act is not None:
-                    # mark any of the outputs as dirty
-                    for tensor in _recursive_tensors(args):
-                        key = hash(tensor)
+                    # mark any of the intputs and outputs as dirty
+                    for t in list(_recursive_tensors(args)) + dirty_inputs:
+                        key = hash(t.untyped_storage())
+                        # print(f"Key for dirty: {key} / {key in block.packed_tensors}")
                         if key in block.packed_tensors:
                             block.dirty_tensors[key] = block.block_id
                 next_block_p = block.id_map.get(block.block_id + block.num_blocks_params - 1)
@@ -106,7 +110,7 @@ class OffloadPostHook(torch.autograd.Function):
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        ctx.block = inputs[0]
+        ctx.block = inputs[0][0]
 
     @staticmethod
     def backward(ctx, *grad_args):
@@ -130,7 +134,7 @@ class OffloadPostHook(torch.autograd.Function):
                 prev_block_act = ctx.block.id_map.get(
                     ctx.block.block_id - ctx.block.num_blocks_act + 1)
                 if prev_block_act is not None:
-                    for i, key in enumerate(prev_block_act.packed_tensors):
+                    for key in prev_block_act.packed_tensors:
                         t, cpu_t = prev_block_act.packed_tensors[key]
                         # this tensor may have already been pre-fetched
                         # in this case, the storage contains something
@@ -140,12 +144,13 @@ class OffloadPostHook(torch.autograd.Function):
 
 
 class OffloadBlockWrapper(nn.Module):
-    def __init__(self, block, block_id, block_id_map, dirty_tensors, stream):
+    def __init__(self, block, block_id, block_id_map, dirty_tensors, all_params, stream):
         super().__init__()
         self.block = block
         self.block_id = block_id
         self.id_map = block_id_map
         self.dirty_tensors = dirty_tensors
+        self.all_params = all_params
         self.stream = stream
         self.num_blocks_params = 0
         self.num_blocks_act = 0
@@ -162,6 +167,7 @@ class OffloadBlockWrapper(nn.Module):
         self.block = self.block.to(device=device)
         # ensure that we have copies for both parameters and gradients
         for p in self.block.parameters():
+            # print(f"Tracking: {hash(p.untyped_storage())} ({self.block_id})")
             # release storage of parameters not (yet) required
             if self.block_id >= self.num_blocks_params - 1:
                 _release_storage(p)
@@ -169,6 +175,7 @@ class OffloadBlockWrapper(nn.Module):
             if (self.block_id < self.num_offload_p or
                     self.block_id >= self.num_blocks - self.num_offload_p):
                 cpu_p = torch.empty_like(p, device="cpu", pin_memory=True)
+                self.all_params[hash(p.untyped_storage())] = self.block_id
             self.params.append((p, cpu_p))
 
         if self.num_blocks_params > self.num_blocks and self.num_blocks_act > self.num_blocks:
@@ -188,7 +195,11 @@ class OffloadBlockWrapper(nn.Module):
             # we're in the last device blocks, so don't pack anything anymore
             return t
 
-        key = hash(t)
+        key = hash(t.untyped_storage())
+        # if this is actually a parameter, don't pack it
+        if key in self.all_params:
+            return t
+        # print(f"Tracking: {key} ({self.block_id})")
         if key in self.packed_tensors:
             # this tensor was already packed by this block
             # nothing to do here, we already offloaded
@@ -202,6 +213,17 @@ class OffloadBlockWrapper(nn.Module):
             # also mark the tensor as non-dirty again
             del self.dirty_tensors[key]
         else:
+            if t.untyped_storage().size() <= 0:
+                other_a = next(
+                    (i for i in self.id_map
+                    for k in self.id_map[i].packed_tensors if k == key),
+                    None
+                )
+                raise ValueError(
+                    f"Packing of block {self.block_id} got a leaked tensor "
+                    f"from block {other_a}. You must only pass tensors between "
+                    "blocks through their `forward` inputs and outputs."
+                )
             # we need to pack the tensor, offload to cpu
             # by default, the tensor is non-dirty
             with torch.cuda.stream(self.stream):
@@ -215,7 +237,13 @@ class OffloadBlockWrapper(nn.Module):
             return key
 
         # this should have already been moved back to device
-        return self.packed_tensors[key][0]
+        t = self.packed_tensors[key][0]
+        if t.untyped_storage().size() <= 0:
+            raise ValueError(
+                f"Tensor with key {hash(t.untyped_storage())} was not "
+                "prefetched correctly for unpacking"
+            )
+        return t
 
     def _forward_none(self, *args, **kwargs):
         return self.block(*args, **kwargs)
@@ -225,17 +253,20 @@ class OffloadBlockWrapper(nn.Module):
             return self.block(*args, **kwargs)
 
     def _forward_param(self, *args, **kwargs):
+        dirty_inputs = list(_recursive_tensors(args)) + list(_recursive_tensors(kwargs))
         args = OffloadPreHook.apply(self, *args)
         args = self.block(*args, **kwargs)
         args = [args] if isinstance(args, torch.Tensor) else args
-        return OffloadPostHook.apply(self, *args)
+        return OffloadPostHook.apply((self, dirty_inputs), *args)
 
     def _forward_full(self, *args, **kwargs):
+        # import pdb; pdb.set_trace()
+        dirty_inputs = list(_recursive_tensors(args)) + list(_recursive_tensors(kwargs))
         args = OffloadPreHook.apply(self, *args)
         with torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack):
             args = self.block(*args, **kwargs)
         args = [args] if isinstance(args, torch.Tensor) else args
-        return OffloadPostHook.apply(self, *args)
+        return OffloadPostHook.apply((self, dirty_inputs), *args)
 
 
 class OffloadingWrapper(nn.Module):
@@ -248,6 +279,7 @@ class OffloadingWrapper(nn.Module):
         self.stream = torch.cuda.Stream()
         self.block_id_map = OrderedDict()
         self.dirty_tensors = dict()
+        self.all_params = dict()
         block_id = 0
         current_stack = [(
             wrapped_module, None, None, isinstance(wrapped_module, block_type)
@@ -263,7 +295,7 @@ class OffloadingWrapper(nn.Module):
                     )
                 new_module = OffloadBlockWrapper(
                     m, block_id, self.block_id_map, self.dirty_tensors,
-                    self.stream
+                    self.all_params, self.stream
                 )
                 setattr(parent, name, new_module)
                 self.block_id_map[block_id] = new_module

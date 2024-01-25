@@ -195,8 +195,13 @@ def fsdp_main(model_kwargs):
     torch.cuda.set_device(local_rank)
     
     # Apply FSDP wrapping to the model
-    if fsdp_config.interleaved_offload:
-        model = OffloadingWrapper(model, T5Block, device=torch.cuda.current_device())
+    do_interleaved = (fsdp_config.interleaved_offload_param != 0 or
+                      fsdp_config.interleaved_offload_act != 0)
+    if do_interleaved:
+        model = OffloadingWrapper(
+            model, T5Block, device=torch.cuda.current_device(),
+            num_blocks_params=fsdp_config.interleaved_offload_param,
+            num_blocks_act=fsdp_config.interleaved_offload_act)
     elif fsdp_config.enabled:
         # Set up FSDP parameters
         mixed_precision_policy, t5_auto_wrap_policy = get_policies(train_config, rank)
@@ -219,7 +224,7 @@ def fsdp_main(model_kwargs):
         model = model.to(device=torch.cuda.current_device())
 
     # Set up optimizer and scheduler
-    if fsdp_config.interleaved_offload:
+    if do_interleaved:
         _apply_optimizer_in_backward(
             optim.AdamW, model.parameters(),
             optimizer_kwargs={"lr": train_config.lr}
@@ -332,7 +337,8 @@ if __name__ == '__main__':
     parser.add_argument("--pool_location", default="default")
     parser.add_argument("--pool_accessed_by", default="default")
     parser.add_argument("--pool_prefetch", default="default")
-    parser.add_argument("--interleaved_offload", type=str2bool, default=None)
+    parser.add_argument("--interleaved_offload_param", type=int, default=None)
+    parser.add_argument("--interleaved_offload_act", type=int, default=None)
     args = parser.parse_args()
 
     model_kwargs = {
@@ -353,7 +359,8 @@ if __name__ == '__main__':
         (fsdp_config, [
             "fsdp_activation_checkpointing",
             "cpu_offload",
-            "interleaved_offload"
+            "interleaved_offload_param",
+            "interleaved_offload_act"
         ]),
         (train_config, [
             "model_name", "batch_size_training", "alloc_type",
