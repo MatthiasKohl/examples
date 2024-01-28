@@ -1,9 +1,13 @@
 import bisect
 from collections import OrderedDict
+from dataclasses import dataclass
 import gc
+import weakref
 
 import torch
 import torch.nn as nn
+from torch.multiprocessing.reductions import StorageWeakRef
+from torch._utils import _rebuild_tensor_v2, get_tensor_metadata
 
 from torch.distributed.optim import _apply_optimizer_in_backward
 
@@ -21,39 +25,98 @@ def _prefetch(t, cpu_t, non_blocking=True):
     t.copy_(cpu_t, non_blocking=non_blocking)
 
 
-def _recursive_tensors(x):
-    if isinstance(x, torch.Tensor):
-        yield x
-        return
-    try:
-        for sub_x in x.values():
-            yield from _recursive_tensors(sub_x)
-    except (AttributeError, TypeError, ValueError, RuntimeError):
-        try:
-            for sub_x in x:
-                yield from _recursive_tensors(sub_x)
-        except (TypeError, ValueError, RuntimeError):
-            pass
+@dataclass
+class OffloadRef:
+    block_id: int
+    key: int
 
 
-# TODO further debugging why we get illegal mem access with the dirty approach
+@dataclass
+class MainOffloadMeta:
+    meta_args: tuple=() # args passed to _rebuild_tensor_v2
+    dtype: torch.dtype=None
+    offload_data: tuple=() # device and offloaded tensor
+    num_views: int=0
+
+
+@dataclass
+class ViewOffloadMeta:
+    meta_args: tuple=() # args passed to _rebuild_tensor_v2
+    dtype: torch.dtype=None
+
+
+def _make_view_meta(t: torch.Tensor):
+    backward_hooks = OrderedDict()  # we don't support hooks for now
+    meta_args = (
+        t.storage_offset(),
+        tuple(t.size()),
+        t.stride(),
+        t.requires_grad,
+        backward_hooks,
+        get_tensor_metadata(t),
+    )
+    return ViewOffloadMeta(meta_args, t.dtype)
+
+
+def _make_main_meta(t: torch.Tensor, offload_data: tuple):
+    view = _make_view_meta(t)
+    return MainOffloadMeta(view.meta_args, view.dtype, offload_data)
+
+# TODO batch-size 16 (both param act offload 2) gets an illegal memory access: run with compute-sanitizer
+# happens during embedding backward (potentially out of block: maybe we are packing things that don't belong
+# to the block at all, but that should be fine?)
+def _preload_packed(block, non_blocking):
+    for key, entry in block.packed_tensors.items():
+        # first, we ignore entries that are simply references to a finalized entry
+        if isinstance(entry, OffloadRef):
+            continue
+        # get the actual owning block and final key
+        main_ref = block.all_packed[key]
+        main_block = block.id_map[main_ref.block_id]
+        # main entry is always the first one
+        main_entry = main_block.packed_tensors[main_ref.key][0]
+        assert isinstance(main_entry, MainOffloadMeta)
+        device, cpu_tensor = main_entry.offload_data
+        if cpu_tensor.device == device:
+            # already pre-loaded (e.g. by another block)
+            continue
+
+        t = torch.empty_like(cpu_tensor, device=device)
+        t.copy_(cpu_tensor, non_blocking=non_blocking)
+        main_entry.offload_data = (device, t)
+
+
+def _cleanup_packed(block, log_domain):
+    # clean-up any packed tensors
+    if block.block_id == 0:
+        block.all_packed.clear()
+    if block.packed_tensors:
+        # check if we had any remaining main entries
+        main_entry = next((
+            v[0] for k, v in block.packed_tensors.items()
+            if isinstance(v, list) and isinstance(v[0], MainOffloadMeta)
+        ), None)
+        if main_entry:
+            print(
+                f"Warning: {log_domain} block {block.block_id}: found "
+                f"main entry in packed tensors: {main_entry}"
+            )
+        block.packed_tensors.clear()
+
+
 class OffloadPreHook(torch.autograd.Function):
     @staticmethod
     def forward(block, *args):
         # pre-forward
         block.stream.synchronize()
+        # clean-up any packed tensors (post-backward may not be enough because
+        # block 0 may not even have any post-backward)
+        _cleanup_packed(block, "pre-forward")
+
         with torch.cuda.stream(block.stream):
             with torch.no_grad():
-                prev_block_act = block.id_map.get(block.block_id - block.num_blocks_act + 1)
-                if prev_block_act is not None:
-                    # release storage of the packed tensors
-                    for key in prev_block_act.packed_tensors:
-                        # only release if not dirty
-                        if key in prev_block_act.dirty_tensors:
-                            continue
-                        _release_storage(prev_block_act.packed_tensors[key][0])
                 prev_block_p = block.id_map.get(block.block_id - block.num_blocks_params + 1)
-                if prev_block_p is not None:
+                if prev_block_p is not None and block.num_blocks_params > 1:
                     for p, _ in prev_block_p.params:
                         _release_storage(p)
                 next_block_p = block.id_map.get(block.block_id + block.num_blocks_params - 1)
@@ -74,11 +137,12 @@ class OffloadPreHook(torch.autograd.Function):
         # this means that once we sync with the main stream here, the gradient
         # is already released and we can move our parameter to CPU
         torch.cuda.current_stream().synchronize()
+        # clean-up any packed tensors (we'll cleanup in pre-forward as well
+        # since this may not be enough, but we can already free up the structure)
+        _cleanup_packed(ctx.block, "post-backward")
+
         with torch.cuda.stream(ctx.block.stream):
             with torch.no_grad():
-                # no tensors (from any block) can be dirty in backward
-                ctx.block.dirty_tensors.clear()
-                ctx.block.packed_tensors.clear()
                 prev_block_p = ctx.block.id_map.get(
                     ctx.block.block_id - ctx.block.num_blocks_params + 1)
                 if prev_block_p is not None:
@@ -89,19 +153,10 @@ class OffloadPreHook(torch.autograd.Function):
 
 class OffloadPostHook(torch.autograd.Function):
     @staticmethod
-    def forward(offload_args, *args):
+    def forward(block, *args):
         # post-forward
-        block, dirty_inputs = offload_args
         with torch.cuda.stream(block.stream):
             with torch.no_grad():
-                next_block_act = block.id_map.get(block.block_id + block.num_blocks_act - 1)
-                if next_block_act is not None:
-                    # mark any of the intputs and outputs as dirty
-                    for t in list(_recursive_tensors(args)) + dirty_inputs:
-                        key = hash(t.untyped_storage())
-                        # print(f"Key for dirty: {key} / {key in block.packed_tensors}")
-                        if key in block.packed_tensors:
-                            block.dirty_tensors[key] = block.block_id
                 next_block_p = block.id_map.get(block.block_id + block.num_blocks_params - 1)
                 if next_block_p is not None:
                     for p, cpu_param in block.params:
@@ -110,7 +165,7 @@ class OffloadPostHook(torch.autograd.Function):
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        ctx.block = inputs[0][0]
+        ctx.block = inputs[0]
 
     @staticmethod
     def backward(ctx, *grad_args):
@@ -123,7 +178,7 @@ class OffloadPostHook(torch.autograd.Function):
             with torch.no_grad():
                 next_block_p = ctx.block.id_map.get(
                     ctx.block.block_id + ctx.block.num_blocks_params - 1)
-                if next_block_p is not None:
+                if next_block_p is not None and ctx.block.num_blocks_params > 1:
                     for p, _ in next_block_p.params:
                         _release_storage(p)
                 prev_block_p = ctx.block.id_map.get(
@@ -133,24 +188,21 @@ class OffloadPostHook(torch.autograd.Function):
                         _prefetch(p, cpu_param)
                 prev_block_act = ctx.block.id_map.get(
                     ctx.block.block_id - ctx.block.num_blocks_act + 1)
-                if prev_block_act is not None:
-                    for key in prev_block_act.packed_tensors:
-                        t, cpu_t = prev_block_act.packed_tensors[key]
-                        # this tensor may have already been pre-fetched
-                        # in this case, the storage contains something
-                        if t.untyped_storage().size() <= 0:
-                            _prefetch(t, cpu_t)
+                if prev_block_act is not None and ctx.block.num_blocks_act > 1:
+                    _preload_packed(prev_block_act, non_blocking=True)
+        if ctx.block.num_blocks_act == 1:
+            _preload_packed(ctx.block, non_blocking=False)
         return None, *grad_args
 
 
 class OffloadBlockWrapper(nn.Module):
-    def __init__(self, block, block_id, block_id_map, dirty_tensors, all_params, stream):
+    def __init__(self, block, block_id, block_id_map, all_params, all_packed, stream):
         super().__init__()
         self.block = block
         self.block_id = block_id
         self.id_map = block_id_map
-        self.dirty_tensors = dirty_tensors
         self.all_params = all_params
+        self.all_packed = all_packed
         self.stream = stream
         self.num_blocks_params = 0
         self.num_blocks_act = 0
@@ -167,7 +219,7 @@ class OffloadBlockWrapper(nn.Module):
         self.block = self.block.to(device=device)
         # ensure that we have copies for both parameters and gradients
         for p in self.block.parameters():
-            # print(f"Tracking: {hash(p.untyped_storage())} ({self.block_id})")
+            # print(f"Tracking: {hash(p)} ({self.block_id})")
             # release storage of parameters not (yet) required
             if self.block_id >= self.num_blocks_params - 1:
                 _release_storage(p)
@@ -175,15 +227,14 @@ class OffloadBlockWrapper(nn.Module):
             if (self.block_id < self.num_offload_p or
                     self.block_id >= self.num_blocks - self.num_offload_p):
                 cpu_p = torch.empty_like(p, device="cpu", pin_memory=True)
-                self.all_params[hash(p.untyped_storage())] = self.block_id
+                key = hash(StorageWeakRef(p.untyped_storage()))
+                self.all_params[key] = self.block_id
             self.params.append((p, cpu_p))
 
+        # for activation offloading, we need both pre-backward and post-backward
+        # hooks, so we just use the full forward anyway
         if self.num_blocks_params > self.num_blocks and self.num_blocks_act > self.num_blocks:
             self.forward = self._forward_none
-        elif self.num_blocks_params > self.num_blocks:
-            self.forward = self._forward_act
-        elif self.num_blocks_act > self.num_blocks:
-            self.forward = self._forward_param
         else:
             self.forward = self._forward_full
 
@@ -191,82 +242,133 @@ class OffloadBlockWrapper(nn.Module):
         gc.collect()
 
     def pack(self, t):
-        if self.block_id > self.num_blocks - self.num_blocks_act or not t.is_cuda:
+        if self.block_id >= self.num_blocks - self.num_blocks_act or not t.is_cuda:
             # we're in the last device blocks, so don't pack anything anymore
             return t
 
-        key = hash(t.untyped_storage())
+        storage = t.untyped_storage()
+        key = hash(StorageWeakRef(storage))
+        # hashes must be strictly positive
+        assert key > 0
+
         # if this is actually a parameter, don't pack it
-        if key in self.all_params:
+        if key in self.all_params and self.num_blocks_params >= self.num_blocks_act:
             return t
-        # print(f"Tracking: {key} ({self.block_id})")
-        if key in self.packed_tensors:
-            # this tensor was already packed by this block
-            # nothing to do here, we already offloaded
-            pass
-        elif key in self.dirty_tensors:
-            # this tensor has been marked as dirty by a previous block
-            # we have to add the reference to it in our packed tensors
-            # but don't need to do anything else
-            prev_block = self.id_map[self.dirty_tensors[key]]
-            self.packed_tensors[key] = prev_block.packed_tensors[key]
-            # also mark the tensor as non-dirty again
-            del self.dirty_tensors[key]
-        else:
-            if t.untyped_storage().size() <= 0:
-                other_a = next(
-                    (i for i in self.id_map
-                    for k in self.id_map[i].packed_tensors if k == key),
-                    None
-                )
-                raise ValueError(
-                    f"Packing of block {self.block_id} got a leaked tensor "
-                    f"from block {other_a}. You must only pass tensors between "
-                    "blocks through their `forward` inputs and outputs."
-                )
-            # we need to pack the tensor, offload to cpu
-            # by default, the tensor is non-dirty
+
+        do_offload = True
+        new_key = key
+        while new_key in self.all_packed:
+            ref = self.all_packed[new_key]
+            if ref.key < 0:
+                # this has been finalized already, we choose a different key
+                new_key += 1
+                continue
+            # `ref` must point to a "main" storage, thus we don't need to offload
+            do_offload = False
+            break
+
+        if do_offload:
             with torch.cuda.stream(self.stream):
                 cpu_t = torch.empty_like(t, device="cpu", pin_memory=True)
                 _offload(t, cpu_t)
-                self.packed_tensors[key] = (t, cpu_t)
-        return key
+            view_idx = 0
+            meta = _make_main_meta(t, (t.device, cpu_t))
+            main_meta = meta
+            self.packed_tensors[new_key] = [meta]
+            self.all_packed[new_key] = OffloadRef(self.block_id, new_key)
+        else:
+            # this must be a view to some existing (non-finalized) storage
+            # we get that reference from `all_packed`, and add the view entry
+            # to this block's packed tensors
+            meta = _make_view_meta(t)
+            main_ref = self.all_packed[new_key]
+            # add the view entry
+            entries = self.packed_tensors.get(new_key, [])
+            view_idx = len(entries)
+            entries.append(meta)
+            self.packed_tensors[new_key] = entries
+            # assign the main meta to increase `num_views` correctly
+            block = self.id_map[main_ref.block_id]
+            main_meta = block.packed_tensors[main_ref.key][0]
 
-    def unpack(self, key):
-        if isinstance(key, torch.Tensor):
-            return key
+        # whether we are the "main" view or not, we always increase the number
+        # of views by exactly 1
+        main_meta.num_views += 1
 
-        # this should have already been moved back to device
-        t = self.packed_tensors[key][0]
-        if t.untyped_storage().size() <= 0:
-            raise ValueError(
-                f"Tensor with key {hash(t.untyped_storage())} was not "
-                "prefetched correctly for unpacking"
+        def on_storage_del(k):
+            if k not in self.packed_tensors:
+                return
+            entries = self.packed_tensors[k]
+            assert not isinstance(entries, OffloadRef)
+            # it's important to assign a new key that can never clash with
+            # any hash an actual storage could produce. This is why we use
+            # the negative number range here
+            new_k = -k
+            while new_k in self.all_packed:
+                new_k -= 1
+            assert new_k not in self.packed_tensors
+            new_ref = OffloadRef(self.block_id, new_k)
+            self.all_packed[k] = new_ref
+            self.all_packed[new_k] = new_ref
+            self.packed_tensors[new_k] = entries
+            # put the new ref in `packed_tensors` as well: anyone trying to
+            # access main storage should go through `all_packed`
+            self.packed_tensors[k] = new_ref
+
+        # only need to add a finalize hook in case we are the main owner
+        if do_offload:
+            weakref.finalize(storage, on_storage_del, new_key)
+
+        return new_key, view_idx
+
+    def unpack(self, key_idx):
+        if isinstance(key_idx, torch.Tensor):
+            return key_idx
+
+        key, view_idx = key_idx
+        # get the actual block and key for this entry
+        main_ref = self.all_packed[key]
+        main_block = self.id_map[main_ref.block_id]
+        main_entry = main_block.packed_tensors[main_ref.key][0]
+        assert isinstance(main_entry, MainOffloadMeta)
+        try:
+            # this tensor has already been moved back to device
+            main_t = main_entry.offload_data[-1]
+            if main_ref.block_id == self.block_id and view_idx == 0:
+                # this is the special case where block ownership did not change
+                # and we have the "main" view: can directly return the tensor
+                return main_t
+            # in all other cases, need to get our view meta and re-construct tensor
+            # if the main entry is in another block, the key for our view entries
+            # may not have changed, just check this here
+            self_entries = self.packed_tensors[key]
+            if isinstance(self_entries, OffloadRef):
+                view_meta = self.packed_tensors[self_entries.key][view_idx]
+            else:
+                view_meta = self_entries[view_idx]
+            storage = torch.storage.TypedStorage(
+                wrap_storage=main_t._typed_storage()._untyped_storage,
+                dtype=view_meta.dtype,
+                _internal=True,
             )
-        return t
+            return _rebuild_tensor_v2(storage, *view_meta.meta_args)
+        finally:
+            # removing any meta entry always decreases the `num_views` of the 
+            # main meta by exactly 1
+            main_entry.num_views -= 1
+            if main_entry.num_views == 0:
+                del main_block.packed_tensors[main_ref.key]
 
     def _forward_none(self, *args, **kwargs):
         return self.block(*args, **kwargs)
 
-    def _forward_act(self, *args, **kwargs):
-        with torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack):
-            return self.block(*args, **kwargs)
-
-    def _forward_param(self, *args, **kwargs):
-        dirty_inputs = list(_recursive_tensors(args)) + list(_recursive_tensors(kwargs))
-        args = OffloadPreHook.apply(self, *args)
-        args = self.block(*args, **kwargs)
-        args = [args] if isinstance(args, torch.Tensor) else args
-        return OffloadPostHook.apply((self, dirty_inputs), *args)
-
     def _forward_full(self, *args, **kwargs):
         # import pdb; pdb.set_trace()
-        dirty_inputs = list(_recursive_tensors(args)) + list(_recursive_tensors(kwargs))
         args = OffloadPreHook.apply(self, *args)
         with torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack):
             args = self.block(*args, **kwargs)
         args = [args] if isinstance(args, torch.Tensor) else args
-        return OffloadPostHook.apply((self, dirty_inputs), *args)
+        return OffloadPostHook.apply(self, *args)
 
 
 class OffloadingWrapper(nn.Module):
@@ -278,8 +380,8 @@ class OffloadingWrapper(nn.Module):
         self.device = device or torch.cuda.current_device()
         self.stream = torch.cuda.Stream()
         self.block_id_map = OrderedDict()
-        self.dirty_tensors = dict()
         self.all_params = dict()
+        self.all_packed = dict()
         block_id = 0
         current_stack = [(
             wrapped_module, None, None, isinstance(wrapped_module, block_type)
@@ -294,8 +396,8 @@ class OffloadingWrapper(nn.Module):
                         "Block type cannot be type of main wrapped module"
                     )
                 new_module = OffloadBlockWrapper(
-                    m, block_id, self.block_id_map, self.dirty_tensors,
-                    self.all_params, self.stream
+                    m, block_id, self.block_id_map, self.all_params,
+                    self.all_packed, self.stream
                 )
                 setattr(parent, name, new_module)
                 self.block_id_map[block_id] = new_module
