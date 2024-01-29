@@ -5,3 +5,6 @@ __pycache__/
 *.txt
 *.err
 test*/
+test_*.py
+*.ncu-rep
+*.nsys-rep

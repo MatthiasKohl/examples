@@ -193,7 +193,7 @@ class OffloadPostHook(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_args):
-        torch.cuda.nvtx.range_push(f"backward {block.block_id}")
+        torch.cuda.nvtx.range_push(f"backward {ctx.block.block_id}")
         # pre-backward
         # wait on operations of our stream here:
         # 1. ensures that parameters and gradients have been brought in
