@@ -11,18 +11,21 @@ from torch._utils import _rebuild_tensor_v2, get_tensor_metadata
 
 from torch.distributed.optim import _apply_optimizer_in_backward
 
+# set this to True to get a fully blocking version
+BLOCKING = False
+# set this to True to get a fully-in-stream-sync version (this is more restrictive than BLOCKING)
+SYNC_STREAM = False
 
-import threading
 
 def _release_storage(t):
     t.untyped_storage().resize_(0)
 
 
-def _offload(t, cpu_t, non_blocking=True):
+def _offload(t, cpu_t, non_blocking=not BLOCKING):
     cpu_t.copy_(t, non_blocking=non_blocking)
 
 
-def _prefetch(t, cpu_t, non_blocking=True):
+def _prefetch(t, cpu_t, non_blocking=not BLOCKING):
     t.untyped_storage().resize_(cpu_t.untyped_storage().size())
     t.copy_(cpu_t, non_blocking=non_blocking)
 
@@ -66,8 +69,7 @@ def _make_main_meta(t: torch.Tensor, device: torch.device, active_tensor: torch.
     return MainOffloadMeta(view.meta_args, view.dtype, device, active_tensor)
 
 
-def _preload_packed(block, non_blocking):
-    # print(f"Preload block {block.block_id}: {len(block.packed_tensors)} potentially packed tensors")
+def _preload_packed(block, non_blocking=not BLOCKING):
     for key, entry in block.packed_tensors.items():
         # first, we ignore entries that are simply references to a finalized entry
         if isinstance(entry, OffloadRef):
@@ -83,10 +85,8 @@ def _preload_packed(block, non_blocking):
             continue
 
         t = torch.empty_like(main_entry.active_tensor, device=main_entry.device)
-        t.copy_(main_entry.active_tensor, non_blocking=True)
+        t.copy_(main_entry.active_tensor, non_blocking=non_blocking)
         main_entry.active_tensor = t
-        # if not torch.all(torch.isfinite(main_entry.active_tensor)).item():
-        #     print(f"Preload got nan in GPU tensor: {main_entry.active_tensor}")
 
 
 def _cleanup_packed(block, log_domain):
@@ -110,27 +110,26 @@ def _cleanup_packed(block, log_domain):
 class OffloadPreHook(torch.autograd.Function):
     @staticmethod
     def forward(block, *args):
+        torch.cuda.nvtx.range_push(f"forward {block.block_id}")
         # pre-forward
         # main stream must wait on our custom stream here to ensure that:
         # 1. we can release storage of offloaded parameters (previous block)
         # 2. parameters have been brought in for current block
         # we do this with host `synchronize` because releasing storage may not be stream-ordered
-        # torch.cuda.current_stream().wait_stream(block.stream)
-        block.stream.synchronize()
-        torch.cuda.current_stream().synchronize()
+        if BLOCKING:
+            block.stream.synchronize()
+            torch.cuda.current_stream().synchronize()
+        else:
+            torch.cuda.current_stream().wait_stream(block.stream)
         # clean-up any packed tensors (post-backward may not be enough because
         # block 0 may not even have any post-backward)
         _cleanup_packed(block, "pre-forward")
-
-        # print(f"pre-forward block {block.block_id}")
 
         with torch.no_grad():
             with torch.cuda.stream(block.stream):
                 prev_block_p = block.id_map.get(block.block_id - block.num_blocks_params + 1)
                 if prev_block_p is not None and block.num_blocks_params > 1:
                     for p, _ in prev_block_p.params:
-                        # if not torch.all(torch.isfinite(p)).item():
-                        #     print(f"Pre-forward release got nan in GPU param: ({prev_block_p.block_id})")
                         _release_storage(p)
                 next_block_p = block.id_map.get(block.block_id + block.num_blocks_params - 1)
                 if next_block_p is not None:
@@ -144,15 +143,16 @@ class OffloadPreHook(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_args):
-        # print(f"post-backward block {ctx.block.block_id}")
         # post-backward
         # the model must be used with _apply_optimizer_in_backward
         # from torch.distributed.optim !
         # this means that once we wait on ops on the main stream here, the gradient
         # is already released and we can move our parameter to CPU
-        # ctx.block.stream.wait_stream(torch.cuda.current_stream())
-        ctx.block.stream.synchronize()
-        torch.cuda.current_stream().synchronize()
+        if BLOCKING:
+            ctx.block.stream.synchronize()
+            torch.cuda.current_stream().synchronize()
+        else:
+            ctx.block.stream.wait_stream(torch.cuda.current_stream())
         # clean-up any packed tensors (we'll cleanup in pre-forward as well
         # since this may not be enough, but we can already free up the structure)
         _cleanup_packed(ctx.block, "post-backward")
@@ -163,11 +163,8 @@ class OffloadPreHook(torch.autograd.Function):
                     ctx.block.block_id - ctx.block.num_blocks_params + 1)
                 if prev_block_p is not None:
                     for p, cpu_param in ctx.block.params:
-                        if not torch.all(torch.isfinite(p)).item():
-                            print(f"Post-backward offload got nan in GPU param: ({ctx.block.block_id})")
-                        # if not torch.all(torch.isfinite(cpu_param)).item():
-                        #     print(f"Preload got nan in CPU param: {cpu_param}")
                         _offload(p, cpu_param)
+        torch.cuda.nvtx.range_pop()
         return None, *grad_args
 
 
@@ -177,17 +174,17 @@ class OffloadPostHook(torch.autograd.Function):
         # post-forward
         # no need to wait on anything here, since the parameters of this block
         # should not be modified by forward
-        # ctx.block.stream.wait_stream(torch.cuda.current_stream())
-        block.stream.synchronize()
-        torch.cuda.current_stream().synchronize()
+        if BLOCKING:
+            block.stream.synchronize()
+            torch.cuda.current_stream().synchronize()
+
         with torch.no_grad():
             with torch.cuda.stream(block.stream):
                 next_block_p = block.id_map.get(block.block_id + block.num_blocks_params - 1)
                 if next_block_p is not None:
                     for p, cpu_param in block.params:
-                        # if not torch.all(torch.isfinite(p)).item():
-                        #     print(f"Post-forward offload got nan in GPU param: ({block.block_id})")
                         _offload(p, cpu_param)
+        torch.cuda.nvtx.range_pop()
         return args[0] if len(args) == 1 else args
 
     @staticmethod
@@ -196,23 +193,24 @@ class OffloadPostHook(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_args):
+        torch.cuda.nvtx.range_push(f"backward {block.block_id}")
         # pre-backward
         # wait on operations of our stream here:
         # 1. ensures that parameters and gradients have been brought in
         # 2. ensures that parameters of the next block (previous in backward order)
         #    can be released
         # we do this with host `synchronize` because releasing storage may not be stream-ordered
-        # torch.cuda.current_stream().wait_stream(ctx.block.stream)
-        ctx.block.stream.synchronize()
-        torch.cuda.current_stream().synchronize()
+        if BLOCKING:
+            ctx.block.stream.synchronize()
+            torch.cuda.current_stream().synchronize()
+        else:
+            torch.cuda.current_stream().wait_stream(ctx.block.stream)
         with torch.no_grad():
             with torch.cuda.stream(ctx.block.stream):
                 next_block_p = ctx.block.id_map.get(
                     ctx.block.block_id + ctx.block.num_blocks_params - 1)
                 if next_block_p is not None and ctx.block.num_blocks_params > 1:
                     for p, _ in next_block_p.params:
-                        # if not torch.all(torch.isfinite(p)).item():
-                        #     print(f"Pre-backward release got nan in GPU param: ({next_block_p.block_id})")
                         _release_storage(p)
                 prev_block_p = ctx.block.id_map.get(
                     ctx.block.block_id - ctx.block.num_blocks_params + 1)
@@ -222,7 +220,7 @@ class OffloadPostHook(torch.autograd.Function):
                 prev_block_act = ctx.block.id_map.get(
                     ctx.block.block_id - ctx.block.num_blocks_act + 1)
                 if prev_block_act is not None and ctx.block.num_blocks_act > 1:
-                    _preload_packed(prev_block_act, non_blocking=True)
+                    _preload_packed(prev_block_act)
         if ctx.block.num_blocks_act == 1:
             _preload_packed(ctx.block, non_blocking=False)
         return None, *grad_args
@@ -252,7 +250,6 @@ class OffloadBlockWrapper(nn.Module):
         self.block = self.block.to(device=device)
         # ensure that we have copies for both parameters and gradients
         for p in self.block.parameters():
-            # print(f"Tracking: {hash(p)} ({self.block_id})")
             # release storage of parameters not (yet) required
             if self.block_id >= self.num_blocks_params - 1:
                 _release_storage(p)
@@ -304,12 +301,8 @@ class OffloadBlockWrapper(nn.Module):
             with torch.no_grad():
                 with torch.cuda.stream(self.stream):
                     cpu_t = torch.empty_like(t, device="cpu", pin_memory=True)
-                    _offload(t, cpu_t, non_blocking=True)
+                    _offload(t, cpu_t)
             view_idx = 0
-            # if not torch.all(torch.isfinite(t)).item():
-            #     print(f"Pack got nan for tensor: {t}")
-            # if not torch.all(torch.isfinite(cpu_t)).item():
-            #     print(f"Pack got nan for CPU tensor: {cpu_t}")
             meta = _make_main_meta(t, t.device, cpu_t)
             main_meta = meta
             self.packed_tensors[new_key] = [meta]
@@ -328,11 +321,6 @@ class OffloadBlockWrapper(nn.Module):
             # assign the main meta to increase `num_views` correctly
             block = self.id_map[main_ref.block_id]
             main_meta = block.packed_tensors[main_ref.key][0]
-            # print(f"Packing key {new_key}/{view_idx}: "
-            #       f"view {t.storage_offset()}/{t.shape}/{t.stride()}/{t.dtype} of "
-            #       f"main tensor {main_meta.meta_args[0]}/{main_meta.meta_args[1]}/{main_meta.meta_args[2]}/{main_meta.dtype} "
-            #       f"#views: {main_meta.num_views}"
-            # )
 
         # whether we are the "main" view or not, we always increase the number
         # of views by exactly 1
@@ -377,12 +365,9 @@ class OffloadBlockWrapper(nn.Module):
         try:
             # this tensor has already been moved back to device
             main_t = main_entry.active_tensor
-            if not torch.all(torch.isfinite(main_t)).item():
-                print(f"Unpack block {self.block_id}: got non-finite value in main tensor")
             if main_ref.block_id == self.block_id and view_idx == 0:
                 # this is the special case where block ownership did not change
                 # and we have the "main" view: can directly return the tensor
-                # print(f"Key {key}/{view_idx} (actual key {main_ref.key}): main meta views: {main_entry.num_views}")
                 return main_t
             # in all other cases, need to get our view meta and re-construct tensor
             # if the main entry is in another block, the key for our view entries
@@ -392,12 +377,6 @@ class OffloadBlockWrapper(nn.Module):
                 view_meta = self.packed_tensors[self_entries.key][view_idx]
             else:
                 view_meta = self_entries[view_idx]
-            # print(f"Unpacking key {key}/{view_idx} (actual key {main_ref.key}): "
-            #       f"view {view_meta.meta_args[0]}/{view_meta.meta_args[1]}/{view_meta.meta_args[2]}/{view_meta.dtype} of "
-            #       f"main tensor {main_t.storage_offset()}/{main_t.shape}/{main_t.stride()}/{main_t.dtype} / "
-            #       f"main meta {main_entry.meta_args[0]}/{main_entry.meta_args[1]}/{main_entry.meta_args[2]}/{main_entry.dtype}, "
-            #       f"#views: {main_entry.num_views}"
-            # )
             storage = torch.storage.TypedStorage(
                 wrap_storage=main_t._typed_storage()._untyped_storage,
                 dtype=view_meta.dtype,
@@ -430,8 +409,10 @@ class OffloadingWrapper(nn.Module):
         self.wrapped_module = wrapped_module
         self.block_type = block_type
         self.device = device or torch.cuda.current_device()
-        self.stream = torch.cuda.Stream()
-        # self.stream = torch.cuda.current_stream()
+        if SYNC_STREAM:
+            self.stream = torch.cuda.current_stream()
+        else:
+            self.stream = torch.cuda.Stream()
         self.block_id_map = OrderedDict()
         self.all_params = dict()
         self.all_packed = dict()
