@@ -78,7 +78,7 @@ class MainOffloadMeta:
     dtype: torch.dtype
     device: torch.device # always the original device of tensor
     active_tensor: torch.Tensor # tensor having currently active values (may require sync)
-    original_tensor: torch.Tensor # holds a reference to original tensor as long as required
+    original_tensor: torch.Tensor # reference to original tensor kept until offloading is complete
     num_views: int=0
 
 
@@ -109,6 +109,43 @@ def _make_main_meta(t: torch.Tensor, device: torch.device,
     )
 
 
+def _get_main_entries(block):
+    def get_main_entry(key, entry):
+        # ignore any previously finalized entries
+        if isinstance(entry, OffloadRef):
+            return None, None
+        # get the actual owning block and final key
+        main_ref = block.all_packed[key]
+        main_block = block.id_map[main_ref.block_id]
+        # main entry is always the first one
+        main_entry = main_block.packed_tensors[main_ref.key][0]
+        assert isinstance(main_entry, MainOffloadMeta)
+        return main_ref.key, main_entry
+    
+    main_entries = (get_main_entry(key, entry) for key, entry in block.packed_tensors.items())
+    # make a dictionary: ensures that we only get each key once
+    return {
+        k: v for k, v in main_entries if v is not None and v.original_tensor is not None
+    }
+
+
+def _offload_packed(block, non_blocking=not BLOCKING):
+    # since we may be deleting tensors here, that will cause finalized
+    # entries to be added, we first get all the entries, then apply offloading
+    main_entries = _get_main_entries(block)
+
+    # issue offloading on the custom stream
+    with torch.cuda.stream(block.act_stream):
+        for main_entry in main_entries.values():
+            main_entry.active_tensor.copy_(main_entry.original_tensor, non_blocking=non_blocking)
+
+
+def _remove_original_tensors(block):
+    main_entries = _get_main_entries(block)
+    for main_entry in main_entries.values():
+        main_entry.original_tensor = None
+
+
 def _preload_packed(block, non_blocking=not BLOCKING):
     for key, entry in block.packed_tensors.items():
         # first, we ignore entries that are simply references to a finalized entry
@@ -134,7 +171,7 @@ def _preload_packed(block, non_blocking=not BLOCKING):
 
 def _cleanup_packed(block, log_domain):
     # clean-up any packed tensors
-    if block.block_id == 0:
+    if block.is_first:
         block.all_packed.clear()
     if block.packed_tensors:
         # check if we had any remaining main entries
@@ -147,35 +184,8 @@ def _cleanup_packed(block, log_domain):
                 f"Warning: {log_domain} block {block.block_id}: found "
                 f"main entry in packed tensors: {main_entry}"
             )
-            _main_wait_on_custom_stream(block.stream)
-            # removing references to original tensors should be done in main stream
-            for k, v in block.packed_tensors.items():
-                if isinstance(v, list) and isinstance(v[0], MainOffloadMeta):
-                    v[0].original_tensor = None
-        # this should be done on the custom stream in case we remove actual
-        # references to tensors we own
-        with torch.cuda.stream(block.stream):
-            block.packed_tensors.clear()
-
-
-def _remove_packed_refs(block):
-    # need to first get main entries, then delete references
-    # otherwise the dictionary size changes
-    def get_main_entry(key, entry):
-        # ignore entries that are simply references to a finalized entry
-        if isinstance(entry, OffloadRef):
-            return None
-        # get the actual owning block and final key
-        main_ref = block.all_packed[key]
-        main_block = block.id_map[main_ref.block_id]
-        main_entry = main_block.packed_tensors[main_ref.key][0]
-        assert isinstance(main_entry, MainOffloadMeta)
-        return main_entry
-
-    main_entries = [get_main_entry(key, entry) for key, entry in block.packed_tensors.items()]
-    for main_entry in main_entries:
-        if main_entry:
-            main_entry.original_tensor = None
+            _main_wait_on_custom_stream(block.act_stream)
+        block.packed_tensors.clear()
 
 
 class OffloadPreHook(torch.autograd.Function):
@@ -184,26 +194,22 @@ class OffloadPreHook(torch.autograd.Function):
         torch.cuda.nvtx.range_push(f"forward {block.block_id}")
         # print(f"block {block.block_id} pre-forward")
         # pre-forward
-        # main stream must wait on our custom stream here to ensure that:
-        # 1. parameters have been brought in for current block
-        # 2. packed tensors of the immediately previous block have been offloaded
-        # TODO should have two streams: this wait means that we immediately wait
-        # on the offloading of previous block's parameters, but we don't need to
+        if block.is_first:
+            # in the very first block, the prefetch stream must wait on the
+            # offload stream to ensure that we take over ownership of any
+            # offloaded parameters
+            block.prefetch_stream.wait_stream(block.offload_stream)
+
+        # main stream must wait on our prefetch stream here to ensure that:
+        # - parameters have been brought in for current block
         if block.num_blocks_params > 1:
-            _main_wait_on_custom_stream(block.stream)
+            _main_wait_on_custom_stream(block.prefetch_stream)
 
         # clean-up any packed tensors (post-backward may not be enough because
         # block 0 may not even have any post-backward)
         _cleanup_packed(block, "pre-forward")
 
-        # remove references to original tensor of immediate previous block
-        # it's important that this is done on main stream after we waited above
-        # because main stream owns the original packed tensors
-        imm_prev_block = block.id_map.get(block.block_id - 1)
-        if imm_prev_block is not None:
-            _remove_packed_refs(imm_prev_block)
-
-        with torch.cuda.stream(block.stream):
+        with torch.cuda.stream(block.prefetch_stream):
             # we prefetch on custom stream: next block will have the main stream
             # wait on this when it gets to pre-forward
             next_block_p = block.id_map.get(block.block_id + block.num_blocks_params - 1)
@@ -213,7 +219,7 @@ class OffloadPreHook(torch.autograd.Function):
 
         if block.num_blocks_params == 1:
             # special case: need to wait on pre-fetched parameters immediately
-            _main_wait_on_custom_stream(block.stream)
+            _main_wait_on_custom_stream(block.prefetch_stream)
 
         return args
 
@@ -227,14 +233,23 @@ class OffloadPreHook(torch.autograd.Function):
         # post-backward
         # the model must be used with _apply_optimizer_in_backward
         # from torch.distributed.optim !
-        # this means that once we wait on ops on the main stream here, the gradient
-        # is already released and we can move our parameter to CPU
-        _custom_stream_wait_on_main(ctx.block.stream)
+        # offload-stream must wait on main here to ensure that we can offload
+        # the updated parameters
+        if ctx.block.num_blocks_params > 1:
+            _custom_stream_wait_on_main(ctx.block.offload_stream)
+
+        # we let the act stream wait on main here, s.t. prefetching
+        # activations does not run ahead of main stream too much (would
+        # cause too many memory allocations otherwise)
+        _custom_stream_wait_on_main(ctx.block.act_stream)
 
         # clean-up any packed tensors (we'll cleanup in pre-forward as well
         # since this may not be enough, but we can already free up the structure)
+        # this is done on the main stream which should own any tensors at this point
+        # (due to waiting for prefetch stream in pre-backward)
         _cleanup_packed(ctx.block, "post-backward")
-        with torch.cuda.stream(ctx.block.stream):
+
+        with torch.cuda.stream(ctx.block.offload_stream):
             # offload in custom stream: the custom stream must have seen the
             # effects of updated parameters due to waiting on main stream above
             prev_block_p = ctx.block.id_map.get(
@@ -242,6 +257,10 @@ class OffloadPreHook(torch.autograd.Function):
             if prev_block_p is not None:
                 for p, cpu_param in ctx.block.params:
                     _offload(p, cpu_param)
+
+        if ctx.block.num_blocks_params == 1:
+            # special case: should wait on offloaded parameters immediately
+            _main_wait_on_custom_stream(block.offload_stream)
 
         torch.cuda.nvtx.range_pop()
         return None, *grad_args
@@ -252,20 +271,43 @@ class OffloadPostHook(torch.autograd.Function):
     def forward(block, *args):
         # print(f"block {block.block_id} post-forward")
         # post-forward
-        # we let the custom stream wait on main stream here to ensure that
-        # we can offload and release storage of parameters on the custom stream
-        # note that this also ensures that the custom stream now "owns" any
-        # tensor that was packed during offload in the block's forward
-        _custom_stream_wait_on_main(block.stream)
+        # we let the offload stream wait on main stream here to ensure that
+        # we can offload and release storage of parameters on that stream
+        if block.num_blocks_params > 1:
+            _custom_stream_wait_on_main(block.offload_stream)
 
-        with torch.cuda.stream(block.stream):
-            # no need to wait on anything here, since the parameters of this block
-            # should not be modified by forward, so we can start offloading anytime
-            # on custom stream
+        with torch.cuda.stream(block.offload_stream):
             next_block_p = block.id_map.get(block.block_id + block.num_blocks_params - 1)
             if next_block_p is not None:
                 for p, cpu_param in block.params:
                     _offload(p, cpu_param)
+
+        if block.is_last:
+            # in the last block, ensure that the prefetch stream waits on 
+            # offload stream s.t. it owns any offloaded parameters
+            block.prefetch_stream.wait_stream(block.offload_stream)
+
+        if block.num_blocks_params == 1:
+            # special case: should wait on offloaded parameters immediately
+            _main_wait_on_custom_stream(block.offload_stream)
+
+        # delete the original tensors of the immediately previous block.
+        # for this, main has to wait for the act stream.
+        if block.num_blocks_act > 1:
+            imm_prev_block = block.id_map.get(block.block_id - 1)
+            if imm_prev_block is not None:
+                _main_wait_on_custom_stream(block.act_stream)
+                _remove_original_tensors(imm_prev_block)
+        # we also let the act stream wait on main here to ensure that we can
+        # offload packed tensors in bulk. After offloading, we also let
+        # the main stream wait on the act stream s.t. references can be deleted
+        _custom_stream_wait_on_main(block.act_stream)
+        _offload_packed(block)
+        if block.num_blocks_act == 1:
+            # special case: need to immediately wait on offloading and remove
+            # tensors
+            _main_wait_on_custom_stream(block.act_stream)
+            _remove_original_tensors(block)
 
         torch.cuda.nvtx.range_pop()
         return args[0] if len(args) == 1 else args
@@ -279,15 +321,17 @@ class OffloadPostHook(torch.autograd.Function):
         # print(f"block {ctx.block.block_id} pre-backward")
         torch.cuda.nvtx.range_push(f"backward {ctx.block.block_id}")
         # pre-backward
-        # wait on operations of our stream here:
-        # 1. ensures that parameters have been brought in
-        # 2. ensures that pre-loaded packed tensors of the current block can be
-        #    used on the main stream (have actually been pre-loaded)
-        # we do this with host `synchronize` because releasing storage may not be stream-ordered
-        if ctx.block.num_blocks_act > 1 or ctx.block.num_blocks_params > 1:
-            _main_wait_on_custom_stream(ctx.block.stream)
+        # let main wait on operations of our prefetch streams here:
+        # - ensures that parameters have been brought in
+        # - ensures that pre-loaded packed tensors of the current block can be
+        #   used on the main stream (have actually been pre-loaded):
+        #   main stream will own these now and delete them
+        if ctx.block.num_blocks_params > 1:
+            _main_wait_on_custom_stream(ctx.block.prefetch_stream)
+        if ctx.block.num_blocks_act > 1:
+            _main_wait_on_custom_stream(ctx.block.act_stream)
 
-        with torch.cuda.stream(ctx.block.stream):
+        with torch.cuda.stream(ctx.block.prefetch_stream):
             # we prefetch on custom stream: custom stream waits on main stream
             # during backward, which ensures that parameters have been released
             # prior to this
@@ -296,8 +340,9 @@ class OffloadPostHook(torch.autograd.Function):
             if prev_block_p is not None:
                 for p, cpu_param in prev_block_p.params:
                     _prefetch(p, cpu_param)
+        with torch.cuda.stream(ctx.block.act_stream):
             # pre-load packed activations: this must be done entirely in
-            # custom stream, since it owns the offloaded (and prefetched)
+            # act stream, since it owns the offloaded (and prefetched)
             # tensors. main stream will wait for this pre-loading in the
             # pre-backward of prev_block when called, before any unpacking happens
             prev_block_act = ctx.block.id_map.get(
@@ -305,28 +350,43 @@ class OffloadPostHook(torch.autograd.Function):
             if prev_block_act is not None:
                 _preload_packed(prev_block_act)
 
-        if ctx.block.num_blocks_params == 1 or ctx.block.num_blocks_act == 1:
+        if ctx.block.num_blocks_params == 1:
             # special case: need to wait on pre-fetched parameters (or act) immediately
-            _main_wait_on_custom_stream(ctx.block.stream)
+            _main_wait_on_custom_stream(ctx.block.prefetch_stream)
+        if ctx.block.num_blocks_act == 1:
+            _main_wait_on_custom_stream(ctx.block.act_stream)
 
         return None, *grad_args
 
 
 class OffloadBlockWrapper(nn.Module):
-    def __init__(self, block, block_id, block_id_map, all_params, all_packed, stream):
+    def __init__(
+                self,
+                block,
+                block_id,
+                block_id_map,
+                all_params,
+                all_packed,
+                prefetch_stream,
+                offload_stream,
+                act_stream,
+            ):
         super().__init__()
         self.block = block
         self.block_id = block_id
         self.id_map = block_id_map
         self.all_params = all_params
         self.all_packed = all_packed
-        self.stream = stream
+        self.prefetch_stream = prefetch_stream
+        self.offload_stream = offload_stream
+        self.act_stream = act_stream
         self.num_blocks_params = 0
         self.num_blocks_act = 0
         self.num_blocks = 0
         self.packed_tensors = dict()
         self.params = []
-        self._unpack_warning_triggered = False
+        self.is_first = block_id == 0
+        self.is_last = None
 
     def initialize(self, num_blocks_params, num_blocks_act, device):
         self.num_blocks_params = num_blocks_params
@@ -334,6 +394,7 @@ class OffloadBlockWrapper(nn.Module):
         self.num_blocks = len(self.id_map)
         self.num_offload_p = self.num_blocks - self.num_blocks_params + 1
         self.block = self.block.to(device=device)
+        self.is_last = self.block_id == self.num_blocks - 1
         # ensure that we have copies for both parameters and gradients
         for p in self.block.parameters():
             # release storage of parameters not (yet) required
@@ -342,7 +403,7 @@ class OffloadBlockWrapper(nn.Module):
             cpu_p = None
             if (self.block_id < self.num_offload_p or
                     self.block_id >= self.num_blocks - self.num_offload_p):
-                with torch.cuda.stream(self.stream):
+                with torch.cuda.stream(self.offload_stream):
                     cpu_p = torch.empty_like(p, device="cpu", pin_memory=True)
                 key = hash(StorageWeakRef(p.untyped_storage()))
                 if key in self.all_params and self.all_params[key] != self.block_id:
@@ -356,10 +417,11 @@ class OffloadBlockWrapper(nn.Module):
 
         # ensure that CPU parameters have been allocated for main stream
         # before continuing
-        _main_wait_on_custom_stream(self.stream)
+        _main_wait_on_custom_stream(self.offload_stream)
         # ensure that parameters are actually released for the custom stream:
-        # at this point, the custom stream owns the parameters
-        _custom_stream_wait_on_main(self.stream)
+        # at this point, the offload stream owns the parameters, as would be
+        # the case after a full backward
+        _custom_stream_wait_on_main(self.offload_stream)
 
         # for activation offloading, we need both pre-backward and post-backward
         # hooks, so we just use the full forward anyway
@@ -398,10 +460,14 @@ class OffloadBlockWrapper(nn.Module):
             break
 
         if do_offload:
+            assert new_key not in self.packed_tensors
+            # cannot offload here immediately because tensor `t` may not be
+            # valid at all (at least w.r.t. custom stream). We'll offload
+            # in bulk in post-forward
             with torch.no_grad():
-                cpu_t = torch.empty_like(t, device="cpu", pin_memory=True)
-                cpu_t.copy_(t, non_blocking=not BLOCKING)
-                meta = _make_main_meta(t, t.device, cpu_t, None)
+                with torch.cuda.stream(self.act_stream):
+                    cpu_t = torch.empty_like(t, device="cpu", pin_memory=True)
+                    meta = _make_main_meta(t, t.device, cpu_t, t)
             view_idx = 0
             main_meta = meta
             self.packed_tensors[new_key] = [meta]
@@ -429,7 +495,12 @@ class OffloadBlockWrapper(nn.Module):
             if k not in self.packed_tensors:
                 return
             entries = self.packed_tensors[k]
-            assert not isinstance(entries, OffloadRef)
+            if isinstance(entries, OffloadRef):
+                # already called this, print warning
+                print(
+                    f"Warning: finalize called twice for storage with key {k}: {entries}"
+                )
+                return
             # it's important to assign a new key that can never clash with
             # any hash an actual storage could produce. This is why we use
             # the negative number range here
@@ -486,9 +557,9 @@ class OffloadBlockWrapper(nn.Module):
             # removing any meta entry always decreases the `num_views` of the 
             # main meta by exactly 1
             main_entry.num_views -= 1
-            # it's important to remove the storage of tensors on the custom
-            # stream since that stream owns these tensors
-            with torch.cuda.stream(self.stream):
+            # the (prefetched) tensor was created by the act stream,
+            # so delete it on that stream as well
+            with torch.cuda.stream(self.act_stream):
                 if main_entry.num_views == 0:
                     del main_block.packed_tensors[main_ref.key]
 
@@ -512,9 +583,13 @@ class OffloadingWrapper(nn.Module):
         self.block_type = block_type
         self.device = device or torch.cuda.current_device()
         if SYNC_STREAM:
-            self.stream = torch.cuda.current_stream()
+            self.prefetch_stream = torch.cuda.current_stream()
+            self.offload_stream = self.prefetch_stream
+            self.act_stream = self.prefetch_stream
         else:
-            self.stream = torch.cuda.Stream()
+            self.prefetch_stream = torch.cuda.Stream()
+            self.offload_stream = torch.cuda.Stream()
+            self.act_stream = torch.cuda.Stream()
         self.block_id_map = OrderedDict()
         self.all_params = dict()
         self.all_packed = dict()
@@ -533,7 +608,8 @@ class OffloadingWrapper(nn.Module):
                     )
                 new_module = OffloadBlockWrapper(
                     m, block_id, self.block_id_map, self.all_params,
-                    self.all_packed, self.stream
+                    self.all_packed, self.prefetch_stream, self.offload_stream,
+                    self.act_stream
                 )
                 setattr(parent, name, new_module)
                 self.block_id_map[block_id] = new_module
