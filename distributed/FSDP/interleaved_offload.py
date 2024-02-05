@@ -393,27 +393,61 @@ class OffloadBlockWrapper(nn.Module):
         self.num_blocks_act = num_blocks_act
         self.num_blocks = len(self.id_map)
         self.num_offload_p = self.num_blocks - self.num_blocks_params + 1
-        self.block = self.block.to(device=device)
         self.is_last = self.block_id == self.num_blocks - 1
+
         # ensure that we have copies for both parameters and gradients
-        for p in self.block.parameters():
-            # release storage of parameters not (yet) required
-            if self.block_id >= self.num_blocks_params - 1:
-                _release_storage(p)
-            cpu_p = None
-            if (self.block_id < self.num_offload_p or
-                    self.block_id >= self.num_blocks - self.num_offload_p):
-                with torch.cuda.stream(self.offload_stream):
-                    cpu_p = torch.empty_like(p, device="cpu", pin_memory=True)
-                key = hash(StorageWeakRef(p.untyped_storage()))
-                if key in self.all_params and self.all_params[key] != self.block_id:
-                    raise ValueError(
-                        "Cannot share parameters between blocks: "
-                        f"Storage with hash {key} owned by {self.all_params[key]} "
-                        f"but also by {self.block_id}"
+        # placed on the right device
+        def init_device(m):
+            do_offload = (
+                self.block_id < self.num_offload_p or
+                self.block_id >= self.num_blocks - self.num_offload_p
+            )
+            for param_key, param in m._parameters.items():
+                if param is None:
+                    continue
+                assert isinstance(param, nn.Parameter)
+                assert param.grad is None, "Must init OffloadingWrapper before gradients"
+                if self.block_id >= self.num_blocks - self.num_offload_p:
+                    # this causes additional GPU memory, but only for one
+                    # param at a time. Otherwise, we could construct a dummy
+                    # tensor just for the storage (with new device), then
+                    # _rebuild_tensor with the real meta args, and release the storage
+                    new_p = nn.Parameter(
+                        torch.empty_like(param, device=device), param.requires_grad
                     )
-                self.all_params[key] = self.block_id
-            self.params.append((p, cpu_p))
+                    _release_storage(new_p)
+                else:
+                    new_p = nn.Parameter(param.to(device=device), param.requires_grad)
+
+                if do_offload:
+                    # this causes additional CPU memory, but only for one param
+                    # at a time. Otherwise, we could try to host-register the
+                    # memory of the original `param` (if it is on CPU)
+                    with torch.cuda.stream(self.offload_stream):
+                        cpu_p = torch.empty_like(param, device="cpu", pin_memory=True)
+
+                    key = hash(StorageWeakRef(new_p.untyped_storage()))
+                    if key in self.all_params and self.all_params[key] != self.block_id:
+                        raise ValueError(
+                            "Cannot share parameters between blocks: "
+                            f"Storage with hash {key} owned by {self.all_params[key]} "
+                            f"but also by {self.block_id}"
+                        )
+                    self.all_params[key] = self.block_id
+                else:
+                    cpu_p = None
+
+                # important: actually replace the parameter in original module
+                m._parameters[param_key] = new_p
+                self.params.append((new_p, cpu_p))
+
+            # move buffers to requested device always
+            for buf_key, buf in m._buffers.items():
+                if buf is not None:
+                    m._buffers[buf_key] = buf.to(device=device)
+
+        with torch.no_grad():
+            self.block.apply(init_device)
 
         # ensure that CPU parameters have been allocated for main stream
         # before continuing
