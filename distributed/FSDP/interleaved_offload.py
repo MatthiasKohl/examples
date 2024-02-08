@@ -190,7 +190,8 @@ def _cleanup_packed(block, log_domain):
 
 class OffloadPreHook(torch.autograd.Function):
     @staticmethod
-    def forward(block, *args):
+    def forward(offload_args, *args):
+        block, is_grad_tracing = offload_args
         torch.cuda.nvtx.range_push(f"forward {block.block_id}")
         # print(f"block {block.block_id} pre-forward")
         # pre-forward
@@ -212,7 +213,10 @@ class OffloadPreHook(torch.autograd.Function):
         with torch.cuda.stream(block.prefetch_stream):
             # we prefetch on custom stream: next block will have the main stream
             # wait on this when it gets to pre-forward
-            next_block_p = block.id_map.get(block.block_id + block.num_blocks_params - 1)
+            next_block_id = block.block_id + block.num_blocks_params - 1
+            if not is_grad_tracing:
+                next_block_id = next_block_id % block.num_blocks
+            next_block_p = block.id_map.get(next_block_id)
             if next_block_p is not None:
                 for p, cpu_param in next_block_p.params:
                     _prefetch(p, cpu_param)
@@ -225,7 +229,7 @@ class OffloadPreHook(torch.autograd.Function):
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        ctx.block = inputs[0]
+        ctx.block = inputs[0][0]
 
     @staticmethod
     def backward(ctx, *grad_args):
@@ -268,7 +272,8 @@ class OffloadPreHook(torch.autograd.Function):
 
 class OffloadPostHook(torch.autograd.Function):
     @staticmethod
-    def forward(block, *args):
+    def forward(offload_args, *args):
+        block, is_grad_tracing = offload_args
         # print(f"block {block.block_id} post-forward")
         # post-forward
         # we let the offload stream wait on main stream here to ensure that
@@ -278,11 +283,15 @@ class OffloadPostHook(torch.autograd.Function):
 
         with torch.cuda.stream(block.offload_stream):
             next_block_p = block.id_map.get(block.block_id + block.num_blocks_params - 1)
-            if next_block_p is not None:
+            do_offload = (
+                (not is_grad_tracing and block.num_blocks_params <= block.num_blocks) or
+                next_block_p is not None
+            )
+            if do_offload:
                 for p, cpu_param in block.params:
                     _offload(p, cpu_param)
 
-        if block.is_last:
+        if block.is_last and is_grad_tracing:
             # in the last block, ensure that the prefetch stream waits on
             # offload stream s.t. it owns any offloaded parameters
             block.prefetch_stream.wait_stream(block.offload_stream)
@@ -291,30 +300,31 @@ class OffloadPostHook(torch.autograd.Function):
             # special case: should wait on offloaded parameters immediately
             _main_wait_on_custom_stream(block.offload_stream)
 
-        # delete the original tensors of the immediately previous block.
-        # for this, main has to wait for the act stream.
-        if block.num_blocks_act > 1:
-            imm_prev_block = block.id_map.get(block.block_id - 1)
-            if imm_prev_block is not None:
+        if is_grad_tracing:
+            # delete the original tensors of the immediately previous block.
+            # for this, main has to wait for the act stream.
+            if block.num_blocks_act > 1:
+                imm_prev_block = block.id_map.get(block.block_id - 1)
+                if imm_prev_block is not None:
+                    _main_wait_on_custom_stream(block.act_stream)
+                    _remove_original_tensors(imm_prev_block)
+            # we also let the act stream wait on main here to ensure that we can
+            # offload packed tensors in bulk. After offloading, we also let
+            # the main stream wait on the act stream s.t. references can be deleted
+            _custom_stream_wait_on_main(block.act_stream)
+            _offload_packed(block)
+            if block.num_blocks_act == 1:
+                # special case: need to immediately wait on offloading and remove
+                # tensors
                 _main_wait_on_custom_stream(block.act_stream)
-                _remove_original_tensors(imm_prev_block)
-        # we also let the act stream wait on main here to ensure that we can
-        # offload packed tensors in bulk. After offloading, we also let
-        # the main stream wait on the act stream s.t. references can be deleted
-        _custom_stream_wait_on_main(block.act_stream)
-        _offload_packed(block)
-        if block.num_blocks_act == 1:
-            # special case: need to immediately wait on offloading and remove
-            # tensors
-            _main_wait_on_custom_stream(block.act_stream)
-            _remove_original_tensors(block)
+                _remove_original_tensors(block)
 
         torch.cuda.nvtx.range_pop()
         return args[0] if len(args) == 1 else args
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        ctx.block = inputs[0]
+        ctx.block = inputs[0][0]
 
     @staticmethod
     def backward(ctx, *grad_args):
@@ -601,7 +611,8 @@ class OffloadBlockWrapper(nn.Module):
         return self.block(*args, **kwargs)
 
     def _forward_full(self, *args, **kwargs):
-        args = OffloadPreHook.apply(self, *args)
+        is_grad_tracing = torch.is_grad_enabled()
+        args = OffloadPreHook.apply((self, is_grad_tracing), *args)
         with torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack):
             args = self.block(*args, **kwargs)
         # TODO use actual hooks for the layers instead of this sorcery
@@ -611,7 +622,7 @@ class OffloadBlockWrapper(nn.Module):
             pack, args = True, args
         else:
             pack, args = False, args
-        args = OffloadPostHook.apply(self, *args)
+        args = OffloadPostHook.apply((self, is_grad_tracing), *args)
         return (args,) if pack else args
 
 
