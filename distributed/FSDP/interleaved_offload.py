@@ -121,7 +121,7 @@ def _get_main_entries(block):
         main_entry = main_block.packed_tensors[main_ref.key][0]
         assert isinstance(main_entry, MainOffloadMeta)
         return main_ref.key, main_entry
-    
+
     main_entries = (get_main_entry(key, entry) for key, entry in block.packed_tensors.items())
     # make a dictionary: ensures that we only get each key once
     return {
@@ -283,7 +283,7 @@ class OffloadPostHook(torch.autograd.Function):
                     _offload(p, cpu_param)
 
         if block.is_last:
-            # in the last block, ensure that the prefetch stream waits on 
+            # in the last block, ensure that the prefetch stream waits on
             # offload stream s.t. it owns any offloaded parameters
             block.prefetch_stream.wait_stream(block.offload_stream)
 
@@ -588,7 +588,7 @@ class OffloadBlockWrapper(nn.Module):
             )
             return _rebuild_tensor_v2(storage, *view_meta.meta_args)
         finally:
-            # removing any meta entry always decreases the `num_views` of the 
+            # removing any meta entry always decreases the `num_views` of the
             # main meta by exactly 1
             main_entry.num_views -= 1
             # the (prefetched) tensor was created by the act stream,
@@ -601,7 +601,6 @@ class OffloadBlockWrapper(nn.Module):
         return self.block(*args, **kwargs)
 
     def _forward_full(self, *args, **kwargs):
-        # import pdb; pdb.set_trace()
         args = OffloadPreHook.apply(self, *args)
         with torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack):
             args = self.block(*args, **kwargs)
