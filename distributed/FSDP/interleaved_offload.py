@@ -604,8 +604,15 @@ class OffloadBlockWrapper(nn.Module):
         args = OffloadPreHook.apply(self, *args)
         with torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack):
             args = self.block(*args, **kwargs)
-        args = [args] if isinstance(args, torch.Tensor) or len(args) == 1 else args
-        return OffloadPostHook.apply(self, *args)
+        # TODO use actual hooks for the layers instead of this sorcery
+        if isinstance(args, torch.Tensor):
+            pack, args = False, (args,)
+        elif len(args) == 1 and isinstance(args[0], torch.Tensor):
+            pack, args = True, args
+        else:
+            pack, args = False, args
+        args = OffloadPostHook.apply(self, *args)
+        return (args,) if pack else args
 
 
 class OffloadingWrapper(nn.Module):
