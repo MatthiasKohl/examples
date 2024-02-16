@@ -5,20 +5,12 @@ import re
 import subprocess
 from configs import train_config
 
-ALLOC_TYPES = ["", "rmm", "fsdp", "fsdp_act_offload", "fsdp_cpu_offload"]
-MODEL_SIZES = [
-    (2048, 5120, 32, 96),
-    (2304, 5760, 32, 96),
-    (2560, 6400, 32, 96),
-    (2816, 7040, 32, 112),
-    (3072, 7680, 32, 128),
-    (3328, 8320, 48, 144),
-    (3584, 8960, 32, 144),
-    (3840, 9600, 32, 160),
-    (4096, 10240, 32, 176),
-    (4096, 10240, 64, 256)
-]
-BATCH_SIZES = [(2 ** x, max(96, 96 + (x - 8) * 8)) for x in range(6)]
+NUM_GPUS = list(range(1, 9))
+DIST_TYPES = ["interleaved-p0-a2", "fsdp", "fsdp_act_cpt", "fsdp_no_shard", "fsdp_no_shard_act_cpt"]
+# for CG1:
+# NUM_GPUS = [1]
+# DIST_TYPES = ["interleaved-p0-a2"]
+BATCH_SIZES = [2 ** x for x in range(8)]
 TIMING_REGEX = re.compile(
     r"Train time: ([0-9-\.]+) s. Full epoch time: ([0-9-\.]+) s")
 STEPS_REGEX = re.compile(r", #epoch steps: (\d+),")
@@ -30,8 +22,8 @@ FULL_LOG_FILE = next(
 )
 
 
-def run_custom_config(config):
-    cmd = ["torchrun", "--nnodes", "1", "--nproc_per_node", "1", "T5_training.py"]
+def run_custom_config(config, n_gpus):
+    cmd = ["torchrun", "--nnodes", "1", "--nproc_per_node", str(n_gpus), "T5_training.py"]
     for k, v in config.items():
         cmd += ["--" + k, "'" + str(v) + "'"]
     return subprocess.run(
@@ -76,72 +68,57 @@ def parse_result(result, config):
     return 0., -1
 
 
-def get_alloc_type_config(alloc_type):
-    config = {"alloc_type": alloc_type}
-    if "fsdp" in alloc_type:
-        # use default allocator here !
-        config["alloc_type"] = ""
+def get_alloc_type_config(dist_type):
+    config = {"alloc_type": ""}
+    if "fsdp" in dist_type:
         config["use_fsdp"] = True
-        config["fsdp_activation_checkpointing"] = "act_offload" in alloc_type
-        config["cpu_offload"] = "cpu_offload" in alloc_type
+        config["fsdp_activation_checkpointing"] = "act_cpt" in dist_type
+        config["fsdp_activation_offloading"] = "act_off" in dist_type
+        config["fsdp_no_shard"] = "no_shard" in dist_type
     else:
         config["use_fsdp"] = False
+    if "interleaved" in dist_type:
+        _, param, act = dist_type.split("-")
+        config["interleaved_offload_param"] = int(param[1:])
+        config["interleaved_offload_act"] = int(act[1:])
     return config
 
 
-def run_model_sizes(out_row, alloc_type):
-    for d_model, d_ff, num_heads, max_pool_gb in MODEL_SIZES:
-        config = get_alloc_type_config(alloc_type)
+def run_batch_sizes(out_row, dist_type, n_gpus):
+    for batch_size in BATCH_SIZES:
+        if batch_size * n_gpus > BATCH_SIZES[-1]:
+            print(f"Skipping global batch size {batch_size * n_gpus} > {BATCH_SIZES[-1]}")
+            out_row.append(-1)
+            continue
+        config = get_alloc_type_config(dist_type)
         config.update({
-            "d_model": d_model, "d_ff": d_ff, "num_heads": num_heads,
-            "alloc_max_pool_size": max_pool_gb * (1024 ** 3)
+            "batch_size_training": batch_size
         })
-        result = run_custom_config(config)
-        time, steps = parse_result(result, config)
-        normed_time = time / (steps * train_config.batch_size_training)
-        print(
-            f"config {config}: got time {time} (#steps/batch size: "
-            f"{steps}/{train_config.batch_size_training}, normed: {normed_time})"
-        )
-        out_row.append(normed_time)
-
-
-def run_batch_sizes(out_row, alloc_type):
-    for batch_size, max_pool_gb in BATCH_SIZES:
-        config = get_alloc_type_config(alloc_type)
-        config.update({
-            "batch_size_training": batch_size,
-            "alloc_max_pool_size": max_pool_gb * (1024 ** 3)
-        })
-        if batch_size > 32:
-            config["max_steps_per_epoch"] = 40 // (batch_size // 32)
-        result = run_custom_config(config)
+        result = run_custom_config(config, n_gpus)
         time, steps = parse_result(result, config)
         normed_time = time / (steps * batch_size)
         print(
-            f"config {config}: got time {time} (#steps/batch size: "
-            f"{steps}/{batch_size}, normed: {normed_time})"
+            f"Dist: {dist_type}, #GPUs {n_gpus}, config {config}: got time "
+            f"{time} (#steps/batch size: {steps}/{batch_size}, "
+            f"normed: {normed_time})"
         )
         out_row.append(normed_time)
 
 
 def main():
-    model_rows, batch_rows = [], []
-    model_header = ["Model size (d_model/d_ff/num_heads)"]
-    model_header += [f"{x[0]}/{x[1]}/{x[2]}" for x in MODEL_SIZES]
-    batch_header = ["Batch size"] + [str(x[0]) for x in BATCH_SIZES]
+    batch_rows = [[] for _ in DIST_TYPES]
+    batch_header = ["Batch size"] + [str(b) for b in BATCH_SIZES]
     out_info = [
-        (model_header, model_rows, "model.csv"),
-        (batch_header, batch_rows, "batch.csv")
+        (batch_header, batch_rows[i], f"{dist_type}.csv")
+        for i, dist_type in enumerate(DIST_TYPES)
     ]
     try:
-        for alloc_type in ALLOC_TYPES:
-            # first shmoo the model sizes
-            model_rows.append([alloc_type or "cuda"])
-            run_model_sizes(model_rows[-1], alloc_type)
-            # shmoo batch sizes with base config otherwise
-            batch_rows.append([alloc_type or "cuda"])
-            run_batch_sizes(batch_rows[-1], alloc_type)
+        for i, dist_type in enumerate(DIST_TYPES):
+            for n_gpus in NUM_GPUS:
+                if n_gpus > 1 and "interleaved" in dist_type:
+                    continue
+                batch_rows[i].append([f"#GPUs: {n_gpus}"])
+                run_batch_sizes(batch_rows[i][-1], dist_type, n_gpus)
     finally:
         print("Dumping CSVs")
         for header, rows, out_file in out_info:
