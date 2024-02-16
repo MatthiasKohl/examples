@@ -90,6 +90,8 @@ def fsdp_main(model_kwargs):
     torch.manual_seed(train_config.seed)
 
     model, tokenizer = setup_model(train_config.model_name, **model_kwargs)
+    if train_config.pure_bf16:
+        model.to(torch.bfloat16)
     # get a mapping from layer ID to T5Block in order to add prefetching hooks
     layer_id, layer_map, layer_id_map = 0, {}, {}
     is_uvm = train_config.alloc_type.lower() == "sam_rmm"
@@ -205,10 +207,11 @@ def fsdp_main(model_kwargs):
     elif fsdp_config.enabled:
         # Set up FSDP parameters
         mixed_precision_policy, t5_auto_wrap_policy = get_policies(train_config, rank)
-        if fsdp_config.cpu_offload is None:
-            offload = None
-        else:
+        if fsdp_config.cpu_offload:
             offload = CPUOffload(offload_params=fsdp_config.cpu_offload)
+        else:
+            offload = None
+
         model = FSDP(model,
             auto_wrap_policy=t5_auto_wrap_policy,
             mixed_precision=mixed_precision_policy,
@@ -217,8 +220,11 @@ def fsdp_main(model_kwargs):
             limit_all_gathers=fsdp_config.limit_all_gathers,
             cpu_offload=offload)
 
-        if fsdp_config.fsdp_activation_checkpointing:
-            policies.apply_fsdp_checkpointing(model)
+        act_cpt = fsdp_config.fsdp_activation_checkpointing
+        act_off = fsdp_config.fsdp_activation_offloading
+        if act_cpt or act_off:
+            assert not (act_cpt and act_off)
+            policies.apply_fsdp_checkpointing(model, act_off)
     else:
         # move model to the GPU
         model = model.to(device=torch.cuda.current_device())
@@ -327,6 +333,8 @@ if __name__ == '__main__':
     parser.add_argument_group("fsdp")
     parser.add_argument("--use_fsdp", type=str2bool, default=None)
     parser.add_argument("--fsdp_activation_checkpointing", type=str2bool, default=None)
+    parser.add_argument("--fsdp_activation_offloading", type=str2bool, default=None)
+    parser.add_argument("--fsdp_no_shard", type=str2bool, default=None)
     parser.add_argument("--cpu_offload", type=str2bool, default=None)
     parser.add_argument_group("training")
     parser.add_argument("--model_name", default=None)
@@ -358,6 +366,7 @@ if __name__ == '__main__':
     group_args = [
         (fsdp_config, [
             "fsdp_activation_checkpointing",
+            "fsdp_activation_offloading",
             "cpu_offload",
             "interleaved_offload_param",
             "interleaved_offload_act"
@@ -377,6 +386,9 @@ if __name__ == '__main__':
                     f"{getattr(group, arg_key)})"
                 )
                 setattr(group, arg_key, val)
+    if args.fsdp_no_shard:
+        print("Using FSDP no-shard strategy !")
+        setattr(fsdp_config, "sharding_strategy", ShardingStrategy.NO_SHARD)
 
     # allow calling directly without torchrun
     if 'LOCAL_RANK' not in os.environ:

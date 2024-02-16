@@ -21,12 +21,13 @@ non_reentrant_wrapper = partial(
 check_fn = lambda submodule: isinstance(submodule, T5Block)
 
 
-def apply_fsdp_checkpointing(model):
+def apply_fsdp_checkpointing(model, is_offload):
     """apply activation checkpointing to model
     returns None as model is updated directly
     """
-    print(f"--> applying fdsp activation checkpointing...")
+    print(f"--> applying fdsp activation checkpointing (offload: {is_offload})...")
 
+    wrapper = offload_wrapper if is_offload else non_reentrant_wrapper
     apply_activation_checkpointing(
-        model, checkpoint_wrapper_fn=offload_wrapper, check_fn=check_fn
+        model, checkpoint_wrapper_fn=wrapper, check_fn=check_fn
     )
