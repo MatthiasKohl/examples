@@ -181,7 +181,7 @@ def fsdp_main(model_kwargs):
 
     setup()
 
-    train_kwargs = {'batch_size': train_config.batch_size_training, 'sampler': sampler1}
+    train_kwargs = {'batch_size': train_config.batch_size_training, 'sampler': sampler1, 'drop_last': True}
     test_kwargs = {'batch_size': train_config.batch_size_testing, 'sampler': sampler2}
     cuda_kwargs = {
         'num_workers': train_config.num_workers_dataloader,

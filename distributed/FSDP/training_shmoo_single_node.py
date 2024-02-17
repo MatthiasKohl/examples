@@ -9,7 +9,7 @@ NUM_GPUS = list(range(1, 9))
 DIST_TYPES = ["interleaved-p0-a2", "fsdp", "fsdp_act_cpt", "fsdp_no_shard", "fsdp_no_shard_act_cpt"]
 # for CG1:
 # NUM_GPUS = [1]
-# DIST_TYPES = ["interleaved-p0-a2"]
+# DIST_TYPES = ["interleaved-p0-a2", "interleaved-p0-a0", "interleaved-p2-a2"]
 BATCH_SIZES = [2 ** x for x in range(8)]
 TIMING_REGEX = re.compile(
     r"Train time: ([0-9-\.]+) s. Full epoch time: ([0-9-\.]+) s")
