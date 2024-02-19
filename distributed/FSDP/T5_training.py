@@ -204,6 +204,8 @@ def fsdp_main(model_kwargs):
             model, T5Block, device=torch.cuda.current_device(),
             num_blocks_params=fsdp_config.interleaved_offload_param,
             num_blocks_act=fsdp_config.interleaved_offload_act)
+        if fsdp_config.interleaved_ddp:
+            model = DistributedDataParallel(model)
     elif fsdp_config.enabled:
         # Set up FSDP parameters
         mixed_precision_policy, t5_auto_wrap_policy = get_policies(train_config, rank)
@@ -347,6 +349,7 @@ if __name__ == '__main__':
     parser.add_argument("--pool_prefetch", default="default")
     parser.add_argument("--interleaved_offload_param", type=int, default=None)
     parser.add_argument("--interleaved_offload_act", type=int, default=None)
+    parser.add_argument("--interleaved_ddp", type=str2bool, default=None)
     args = parser.parse_args()
 
     model_kwargs = {
@@ -369,7 +372,8 @@ if __name__ == '__main__':
             "fsdp_activation_offloading",
             "cpu_offload",
             "interleaved_offload_param",
-            "interleaved_offload_act"
+            "interleaved_offload_act",
+            "interleaved_ddp"
         ]),
         (train_config, [
             "model_name", "batch_size_training", "alloc_type",

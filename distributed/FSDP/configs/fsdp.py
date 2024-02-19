@@ -16,3 +16,4 @@ class fsdp_config:
     cpu_offload: bool=False
     interleaved_offload_param: int=0
     interleaved_offload_act: int=0
+    interleaved_ddp: bool=False
