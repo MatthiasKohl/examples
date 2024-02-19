@@ -50,6 +50,10 @@ def _prefetch(t, cpu_t, non_blocking=not BLOCKING):
     t.copy_(cpu_t, non_blocking=non_blocking)
 
 
+def _is_offloaded(t):
+    return t.untyped_storage().size() == 0
+
+
 if BLOCKING:
     def _sync_if_blocking(x):
         x.synchronize()
@@ -246,8 +250,11 @@ class OffloadPreHook(torch.autograd.Function):
                 next_block_id = next_block_id % block.num_blocks
             next_block_p = block.id_map.get(next_block_id)
             if next_block_p is not None:
+                # only prefetch parameters that were actually offloaded:
+                # it's possible we don't offload parameters for optimizer
                 for p, cpu_param in next_block_p.params:
-                    _prefetch(p, cpu_param)
+                    if _is_offloaded(p):
+                        _prefetch(p, cpu_param)
         # mark the prefetching of parameters for next block
         if next_block_p is not None:
             block.prefetch_stream.record_event(next_block_p.prefetch_event)
