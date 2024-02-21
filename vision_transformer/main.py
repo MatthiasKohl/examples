@@ -49,9 +49,9 @@ class InputEmbedding(nn.Module):
         # Linear projection
         self.LinearProjection = nn.Linear(self.input_size, self.latent_size)
         # Class token
-        self.class_token = nn.Parameter(torch.randn(self.batch_size, 1, self.latent_size)).to(self.device)
+        self.class_token = nn.Parameter(torch.randn(self.batch_size, 1, self.latent_size).to(self.device))
         # Positional embedding
-        self.pos_embedding = nn.Parameter(torch.randn(self.batch_size, 1, self.latent_size)).to(self.device)
+        self.pos_embedding = nn.Parameter(torch.randn(self.batch_size, 1, self.latent_size).to(self.device))
 
     def forward(self, input_data):
         input_data = input_data.to(self.device)
@@ -218,7 +218,7 @@ def main():
     parser.add_argument('--n-channels', type=int, default=3,
                         help='number of channels in images (default : 3 for RGB)')
     parser.add_argument('--num-heads', type=int, default=12,
-                        help='(default : 16)')
+                        help='(default : 12)')
     parser.add_argument('--num-encoders', type=int, default=12,
                         help='number of encoders (default : 12)')
     parser.add_argument('--dropout', type=int, default=0.1,
