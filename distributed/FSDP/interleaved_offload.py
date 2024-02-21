@@ -152,10 +152,8 @@ def _offload_packed(block, non_blocking=not BLOCKING):
 
 def _remove_original_tensors(block):
     main_entries = _get_main_entries(block)
-    with torch.cuda.stream(block.act_stream):
-        for main_entry in main_entries.values():
-            main_entry.original_tensor = None
-    block.act_stream.record_event(block.act_event_del)
+    for main_entry in main_entries.values():
+        main_entry.original_tensor = None
 
 
 def _preload_packed(block, non_blocking=not BLOCKING):
@@ -224,9 +222,10 @@ class OffloadPreHook(torch.autograd.Function):
             # which ensures that whether forward or backward was previously
             # called, prefetch stream now owns the parameters
             _custom_stream_wait_on_event(
-                block.prefetch_stream, block.offload_events[0])
+                block.prefetch_stream, block.offload_event)
             _custom_stream_wait_on_event(
-                block.prefetch_stream, block.offload_events[block.num_blocks - 1])
+                block.prefetch_stream,
+                block.id_map[block.num_blocks - 1].offload_event)
 
         # clean-up any packed tensors (post-backward may not be enough because
         # block 0 may not even have any post-backward)
@@ -322,6 +321,23 @@ class OffloadPostHook(torch.autograd.Function):
         # record an event signaling that main stream computation of this block
         # is done
         block.main_event.record()
+
+        if is_grad_tracing:
+            # let the act stream wait on main here to ensure that we can
+            # offload packed tensors in bulk.
+            _custom_stream_wait_on_event(block.act_stream, block.main_event)
+            _offload_packed(block)
+
+            # delete the original tensors of the previous block.
+            # for this, main has to wait for the offload event, and then delete
+            # event of the block previous to that one
+            prev_block_act = block.id_map.get(block.block_id - block.num_blocks_act + 1)
+            if prev_block_act is not None:
+                _main_wait_on_custom_event(prev_block_act.act_event_off)
+                # deleting the original tensors can now happen on the main stream,
+                # and no additional wait is required
+                _remove_original_tensors(prev_block_act)
+
         # we let the offload stream wait on main stream here to ensure that
         # we can release storage of parameters on that stream
         _custom_stream_wait_on_event(block.offload_stream, block.main_event)
@@ -346,35 +362,6 @@ class OffloadPostHook(torch.autograd.Function):
         if block.num_blocks_params == 1:
             # special case: should wait on offloaded parameters immediately
             _main_wait_on_custom_event(block.offload_event)
-
-        if is_grad_tracing:
-            # let the act stream wait on main here to ensure that we can
-            # offload packed tensors in bulk.
-            _custom_stream_wait_on_event(block.act_stream, block.main_event)
-            _offload_packed(block)
-
-            # delete the original tensors of the immediately previous block.
-            # for this, main has to wait for the pack event, and the delete
-            # event of the block previous to that one
-            if block.num_blocks_act > 1:
-                imm_prev_block = block.id_map.get(block.block_id - 1)
-                imm2_prev_block = block.id_map.get(block.block_id - 2)
-            else:
-                imm_prev_block = block
-                imm2_prev_block = block
-            if imm_prev_block is not None:
-                _main_wait_on_custom_event(imm_prev_block.act_event_off)
-                _remove_original_tensors(imm_prev_block)
-            if imm2_prev_block is not None:
-                _main_wait_on_custom_event(imm2_prev_block.act_event_del)
-            # important note: if `num_blocks_act == 1`, then we must wait on
-            # both offloading and deletion of packed tensors of this block here.
-            # if `num_blocks_act > 1`, then the very last block must have waited
-            # on the offloading of the second-to-last block. However, we may
-            # not have waited on the deletion of offloading of the second-to-last
-            # block after the forward pass (only for the third-to-last block).
-            # Note that with `num_blocks_act > 1`, nothing gets offloaded for
-            # the second-to-last block anyway, so this is not an issue.
 
         torch.cuda.nvtx.range_pop()
         return args[0] if len(args) == 1 else args
@@ -419,7 +406,9 @@ class OffloadPostHook(torch.autograd.Function):
         if prev_block_act is not None:
             _preload_packed(prev_block_act)
         # wait on the pre-loading for this block to be done
-        _main_wait_on_custom_event(ctx.block.act_event_off)
+        # for the last block, we never pack anything, so avoid the wait
+        if not ctx.block.is_last:
+            _main_wait_on_custom_event(ctx.block.act_event_off)
 
         return None, *grad_args
 
@@ -432,10 +421,9 @@ class OffloadBlockWrapper(nn.Module):
                 block_id_map,
                 all_params,
                 all_packed,
-                prefetch_stream_events,
-                offload_stream_events,
-                act_stream_events,
-                main_events,
+                prefetch_stream,
+                offload_stream,
+                act_stream,
             ):
         super().__init__()
         self.block = block
@@ -443,10 +431,9 @@ class OffloadBlockWrapper(nn.Module):
         self.id_map = block_id_map
         self.all_params = all_params
         self.all_packed = all_packed
-        self.prefetch_stream, self.prefetch_events = prefetch_stream_events
-        self.offload_stream, self.offload_events = offload_stream_events
-        self.act_stream, self.act_events = act_stream_events
-        self.main_events = main_events
+        self.prefetch_stream = prefetch_stream
+        self.offload_stream = offload_stream
+        self.act_stream = act_stream
         self.num_blocks_params = 0
         self.num_blocks_act = 0
         self.num_blocks = 0
@@ -463,14 +450,9 @@ class OffloadBlockWrapper(nn.Module):
         self.num_blocks = len(self.id_map)
         self.is_last = self.block_id == self.num_blocks - 1
         self.prefetch_event = torch.cuda.Event()
-        self.prefetch_events[self.block_id] = self.prefetch_event
         self.offload_event = torch.cuda.Event()
-        self.offload_events[self.block_id] = self.offload_event
         self.act_event_off = torch.cuda.Event()
-        self.act_event_del = torch.cuda.Event()
-        self.act_events[self.block_id] = (self.act_event_off, self.act_event_del)
         self.main_event = torch.cuda.Event()
-        self.main_events[self.block_id] = self.main_event
 
         # ensure that we have copies for both parameters and gradients
         # placed on the right device
@@ -673,8 +655,8 @@ class OffloadBlockWrapper(nn.Module):
             main_entry.num_views -= 1
             # the (prefetched) tensor was created by the act stream,
             # so delete it on that stream as well
-            with torch.cuda.stream(self.act_stream):
-                if main_entry.num_views == 0:
+            if main_entry.num_views == 0:
+                with torch.cuda.stream(self.act_stream):
                     del main_block.packed_tensors[main_ref.key]
 
     def _forward_none(self, *args, **kwargs):
@@ -711,7 +693,6 @@ class OffloadingWrapper(nn.Module):
             self.prefetch_stream = torch.cuda.Stream()
             self.offload_stream = torch.cuda.Stream()
             self.act_stream = torch.cuda.Stream()
-        self.all_events = [dict() for _ in range(4)]
         self.block_id_map = OrderedDict()
         self.all_params = dict()
         self.all_packed = dict()
@@ -730,11 +711,8 @@ class OffloadingWrapper(nn.Module):
                     )
                 new_module = OffloadBlockWrapper(
                     m, block_id, self.block_id_map, self.all_params,
-                    self.all_packed,
-                    (self.prefetch_stream, self.all_events[0]),
-                    (self.offload_stream, self.all_events[1]),
-                    (self.act_stream, self.all_events[2]),
-                    self.all_events[3]
+                    self.all_packed, self.prefetch_stream, self.offload_stream,
+                    self.act_stream,
                 )
                 setattr(parent, name, new_module)
                 self.block_id_map[block_id] = new_module
