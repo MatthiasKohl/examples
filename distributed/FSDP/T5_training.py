@@ -29,6 +29,7 @@ import time
 from cuda import cudart
 
 from interleaved_offload import OffloadingWrapper, _apply_optimizer_in_backward
+from torch.nn.parallel import DistributedDataParallel
 from transformers.models.t5.modeling_t5 import T5Block
 
 PAGE_SIZE = os.sysconf('SC_PAGE_SIZE')
@@ -205,7 +206,17 @@ def fsdp_main(model_kwargs):
             num_blocks_params=fsdp_config.interleaved_offload_param,
             num_blocks_act=fsdp_config.interleaved_offload_act)
         if fsdp_config.interleaved_ddp:
-            model = DistributedDataParallel(model)
+            # for DDP, we apply offloading only to the frozen params
+            # (for now, DDP and interleaved offloading are not aware of each other).
+            # Plus, we must set any frozen parameters as ignored by DDP:
+            # even though DDP doesn't apply to frozen parameters, it still attempts
+            # to synchronize the module initially including frozen parameters,
+            # which does not work with models that are partially offloaded
+            # finally, we use a static graph for DDP since the wrapper already
+            # assumes having a static graph
+            params_to_ignore = set(n for n, p in model.named_parameters() if not p.requires_grad)
+            DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(model, params_to_ignore)
+            model = DistributedDataParallel(model, static_graph=True)
     elif fsdp_config.enabled:
         # Set up FSDP parameters
         mixed_precision_policy, t5_auto_wrap_policy = get_policies(train_config, rank)
